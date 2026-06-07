@@ -103,14 +103,23 @@ PyTorch wheel.
 | `torch.compile(transformer)` | **off** (opt in via `SPARKLERS_TRY_TORCH_COMPILE=1`) | Inductor fusion. On Tegra Orin (torch 2.8 / cu126 / jetson-ai-lab wheel) this either hangs (reduce-overhead/CUDA Graphs) or recompiles per input shape until timeout. Safe to enable if a future wheel fixes it. |
 | Lower NFE steps | UI dropdown | The single biggest perceived speedup is dropping `nfe_step`. F5-TTS uses Empirically-Pruned Step Sampling (EPSS) for low NFE — even nfe=4 is usable for short replies. |
 
-NFE → RTF map on an Orin Nano Super 8 GB at fp16:
+NFE → wall-clock latency on an Orin Nano Super 8 GB at fp16, MAXN
+SUPER, after the multi-shape warmup. Numbers are the time you wait
+between hitting Synthesize and the audio being ready to play. Steady
+state — not the cold first-call.
 
-| NFE | RTF | Use when |
-|---|---|---|
-| 4 | ~0.20 | demos, short replies, sub-1 s budget |
-| 8 ⭐ | 0.47 | daily driver |
-| 16 | 0.76 | longer paragraphs, marginal quality bump |
-| 32 | 1.51 | offline, best zero-shot quality |
+| NFE | 1 s audio | 6 s audio | 19 s audio |
+|---|---|---|---|
+| **4** ⚡ | ~1.0 s | ~1.5 s | ~3.6 s |
+| 6 | ~1.5 s | ~2.2 s | ~5.3 s |
+| **8** ⭐ | ~1.9 s | ~2.8 s | ~7.0 s |
+| 12 | ~2.8 s | ~4.2 s | ~10.4 s |
+| 16 | ~3.7 s | ~5.5 s | ~13.9 s |
+| 32 | ~7.3 s | ~11.0 s | ~27.6 s |
+
+Defaults to **NFE=8** because that matches the F5-TTS-recommended
+quality bar. Switch to **NFE=4** in the dropdown for ultra-fast
+short replies (still very listenable).
 
 ---
 

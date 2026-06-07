@@ -236,25 +236,31 @@ def warmup() -> None:
         except Exception:
             log.exception("ref-cache warm failed for voice=%s", v.key)
 
-    # 3) dummy synth to fill cudnn / inductor caches
+    # 3) dummy synths across two text lengths to fill cuDNN kernel cache
+    #    for short AND long shapes (cuDNN autotunes per shape).
     if voices:
-        try:
-            import time as _t
-            warm_voice = voices[0].key
-            t0 = _t.monotonic()
-            out_path = OUT_AUDIO / "_warmup_dummy.wav"
-            speak(
-                warm_voice, "Warmup.",
-                nfe_step=DEFAULT_NFE, tau=DEFAULT_CFG,
-                output=out_path,
-            )
+        import time as _t
+        warm_voice = voices[0].key
+        warmup_texts = [
+            "Hi.",                                              # short shape
+            "This is a longer warmup so cuDNN picks the right "
+            "kernels for paragraph-length input shapes too.",   # long shape
+        ]
+        for txt in warmup_texts:
             try:
-                out_path.unlink()
-            except OSError:
-                pass
-            log.info("dummy-synth warm complete in %.2fs", _t.monotonic() - t0)
-        except Exception:
-            log.exception("dummy-synth warm failed")
+                t0 = _t.monotonic()
+                out_path = OUT_AUDIO / "_warmup_dummy.wav"
+                speak(
+                    warm_voice, txt,
+                    nfe_step=DEFAULT_NFE, tau=DEFAULT_CFG,
+                    output=out_path,
+                )
+                try: out_path.unlink()
+                except OSError: pass
+                log.info("dummy-synth (%d chars) warm complete in %.2fs",
+                         len(txt), _t.monotonic() - t0)
+            except Exception:
+                log.exception("dummy-synth warm failed (text=%r)", txt[:30])
 
 
 def _hard_trim_silence_inplace(
