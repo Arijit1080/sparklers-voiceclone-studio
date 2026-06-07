@@ -88,6 +88,32 @@ These are the defaults baked into the UI — change at your own risk.
 
 ---
 
+## Speed optimizations
+
+The synth path applies several Jetson-specific tweaks. Most are free and
+on by default; one is opt-in because it's flaky on the current Tegra
+PyTorch wheel.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `nvpmodel -m 0` (MAXN SUPER) + `jetson_clocks` | recommended | Locks the GPU/CPU/EMC clocks at max so the scheduler doesn't down-clock between calls. ~5-10% latency reduction. |
+| `cudnn.benchmark=True` + TF32 matmul | on | cuDNN auto-tunes its kernel choice per input shape and caches the winner. TF32 keeps Tensor Cores hot for the few fp32 paths. |
+| Reference-audio pre-cache (per voice) | on | At `/api/warmup` we run F5-TTS's `preprocess_ref_audio_text` for every enrolled voice so the in-process cache is filled. Saves ~100-200 ms on first synth per voice. |
+| Dummy warmup synth | on | The very first inference per process shape triggers cuDNN autotune (~2-3× slower than steady state). We do it ourselves at warmup so the user-visible first call lands hot. |
+| `torch.compile(transformer)` | **off** (opt in via `SPARKLERS_TRY_TORCH_COMPILE=1`) | Inductor fusion. On Tegra Orin (torch 2.8 / cu126 / jetson-ai-lab wheel) this either hangs (reduce-overhead/CUDA Graphs) or recompiles per input shape until timeout. Safe to enable if a future wheel fixes it. |
+| Lower NFE steps | UI dropdown | The single biggest perceived speedup is dropping `nfe_step`. F5-TTS uses Empirically-Pruned Step Sampling (EPSS) for low NFE — even nfe=4 is usable for short replies. |
+
+NFE → RTF map on an Orin Nano Super 8 GB at fp16:
+
+| NFE | RTF | Use when |
+|---|---|---|
+| 4 | ~0.20 | demos, short replies, sub-1 s budget |
+| 8 ⭐ | 0.47 | daily driver |
+| 16 | 0.76 | longer paragraphs, marginal quality bump |
+| 32 | 1.51 | offline, best zero-shot quality |
+
+---
+
 ## Hardware
 
 | Part                | Notes                                                                  |

@@ -19,12 +19,14 @@
       <input id="tau" type="number" min="0.5" max="6.0" step="0.5" value="3.0">
       <span class="small muted">Higher = closer to you</span>
     </div>
-    <div class="col" style="flex-basis:200px">
+    <div class="col" style="flex-basis:220px">
       <label for="nfe">NFE steps (speed ↔ quality)</label>
       <select id="nfe">
-        <option value="8"           >  8 — ⚡⚡⚡ RTF 0.41</option>
+        <option value="4"           >  4 — ⚡⚡⚡⚡ ultra</option>
+        <option value="6"           >  6 — ⚡⚡⚡⚡</option>
+        <option value="8" selected  >  8 — ⚡⚡⚡ RTF 0.47 ⭐</option>
         <option value="12"          > 12 — ⚡⚡  RTF 0.58</option>
-        <option value="16" selected > 16 — ⚡   RTF 0.76 ⭐</option>
+        <option value="16"          > 16 — ⚡   RTF 0.76</option>
         <option value="20"          > 20 — real-time</option>
         <option value="24"          > 24</option>
         <option value="32"          > 32 — slow</option>
@@ -106,7 +108,7 @@
     const text      = document.getElementById('text').value.trim();
     const speed     = parseFloat(document.getElementById('speed').value || '1');
     const tau       = parseFloat(document.getElementById('tau').value || '3.0');
-    const nfe_step  = parseInt(document.getElementById('nfe').value || '16', 10);
+    const nfe_step  = parseInt(document.getElementById('nfe').value || '8', 10);
     const playback  = document.getElementById('playback').value;
     if (!text) { toast('Enter some text first', 'bad'); return; }
     synthBtn.disabled = true; synthBtn.textContent = 'Synthesizing…';

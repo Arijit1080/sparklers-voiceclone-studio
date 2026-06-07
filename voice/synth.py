@@ -28,6 +28,25 @@ from .registry import embedding_path, enroll_wav_path, load_meta
 
 log = logging.getLogger("voice.synth")
 
+# ---------- one-shot CUDA performance knobs ----------
+# These have to land before any module that touches CUDA runs (which
+# basically means: as a side effect of importing voice.synth, before any
+# F5-TTS code).
+#
+#   cudnn.benchmark    auto-pick the fastest cuDNN algo per input shape
+#                      (one-time per shape; cached thereafter)
+#   TF32 matmuls       Tensor Cores in TF32 mode for fp32 paths — F5 is
+#                      mostly fp16 but text encoder + a few ops stay fp32
+#   allow_tf32         legacy alias, set both to be safe
+try:
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    log.exception("could not enable cudnn perf knobs")
+
 # ---------- lazy globals ----------
 
 _F5 = None
@@ -62,6 +81,28 @@ def _get_f5():
     from f5_tts.api import F5TTS
     log.info("loading F5-TTS on %s", _DEVICE)
     _F5 = F5TTS(device=_DEVICE)
+
+    # ---------- torch.compile the hot path (OPT-IN) ----------
+    # Default off because on Tegra Orin Nano (torch 2.8 + cu126 +
+    # jetson-ai-lab wheel), inductor either hangs forever on variable
+    # input shapes (reduce-overhead/CUDA Graphs) or recompiles per
+    # shape until it timing-outs (default mode). Eager mode + cudnn
+    # autotune already gets us most of the way.
+    #
+    # Set SPARKLERS_TRY_TORCH_COMPILE=1 to opt in if a future torch
+    # wheel fixes the Tegra compile path.
+    import os
+    if (os.environ.get("SPARKLERS_TRY_TORCH_COMPILE", "") == "1"
+            and hasattr(torch, "compile") and _DEVICE.startswith("cuda")):
+        try:
+            log.info("torch.compile(ema_model.transformer, mode='default')")
+            _F5.ema_model.transformer = torch.compile(
+                _F5.ema_model.transformer,
+                mode="default", dynamic=True, fullgraph=False,
+            )
+        except Exception:
+            log.exception("torch.compile failed — falling back to eager")
+
     return _F5
 
 
@@ -121,8 +162,9 @@ def speak(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.monotonic()
-    # F5TTS.infer() writes the WAV when file_wave is given.
-    f5.infer(
+    # F5TTS.infer() returns (wav, sr, spectrogram) AND writes the WAV.
+    # Capturing the return saves a second file open for duration calc.
+    wav, sr, _ = f5.infer(
         ref_file=str(ref_wav),
         ref_text=ref_text,
         gen_text=text,
@@ -132,18 +174,16 @@ def speak(
         cfg_strength=tau,
         sway_sampling_coef=DEFAULT_SWAY,
         target_rms=TARGET_RMS,
-        # F5's own silence-removal is too conservative — we do a stricter
-        # RMS-based trim ourselves below.
+        # F5's own silence-removal is too conservative — we strip head/
+        # tail silence ourselves in-memory and rewrite only if needed.
         remove_silence=False,
         cross_fade_duration=0.15,
     )
-    # Hard-trim silence from both ends so chunks abut cleanly.
-    _hard_trim_silence(output)
+    # Cheap in-memory silence trim (no re-read; rewrites only when it
+    # actually crops > ~30 ms).
+    n_out = _hard_trim_silence_inplace(wav, sr, output)
     elapsed = time.monotonic() - t0
-
-    # Read duration from header
-    info = sf.info(str(output))
-    seconds = info.frames / float(info.samplerate)
+    seconds = n_out / float(sr)
 
     rtf = elapsed / max(0.01, seconds)
     log.info("synth %s nfe=%d cfg=%.1f '%s' → %s (%.2fs audio, %.2fs wall, rtf=%.2f)",
@@ -163,61 +203,108 @@ def speak(
 
 
 def warmup() -> None:
-    """Force-load F5-TTS so the first /speak call is hot."""
-    _get_f5()
+    """Heavy-warm F5-TTS so the very first user-visible /speak is hot.
+
+    Three things happen here:
+      1. Load the F5TTS model (~10-20 s cold).
+      2. Pre-cache reference-audio preprocessing for every enrolled
+         voice (F5-TTS caches by audio bytes in-process).
+      3. Run ONE dummy synth so cudnn.benchmark picks fastest kernels
+         per shape and the inductor caches are filled. This is the
+         single biggest perceived-speed win — the first real user
+         synth then runs in steady-state RTF instead of paying a
+         first-call cudnn-autotune tax (~2-3× slower).
+    """
+    f5 = _get_f5()
+
+    from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+    from .registry import list_voices
+
+    voices = list_voices()
+
+    # 2) pre-cache reference preprocessing for each voice
+    for v in voices:
+        ref = enroll_wav_path(v.key)
+        if not ref.exists():
+            continue
+        try:
+            preprocess_ref_audio_text(
+                str(ref), v.ref_text or "Hello.",
+                show_info=lambda *_a, **_k: None,
+            )
+            log.info("ref-cache warmed for voice=%s", v.key)
+        except Exception:
+            log.exception("ref-cache warm failed for voice=%s", v.key)
+
+    # 3) dummy synth to fill cudnn / inductor caches
+    if voices:
+        try:
+            import time as _t
+            warm_voice = voices[0].key
+            t0 = _t.monotonic()
+            out_path = OUT_AUDIO / "_warmup_dummy.wav"
+            speak(
+                warm_voice, "Warmup.",
+                nfe_step=DEFAULT_NFE, tau=DEFAULT_CFG,
+                output=out_path,
+            )
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+            log.info("dummy-synth warm complete in %.2fs", _t.monotonic() - t0)
+        except Exception:
+            log.exception("dummy-synth warm failed")
 
 
-def _hard_trim_silence(
+def _hard_trim_silence_inplace(
+    audio,
+    sr: int,
     wav_path: Path,
     head_db: float = -42.0,
     tail_db: float = -42.0,
     fade_ms: int = 15,
-) -> None:
-    """In-place trim leading/trailing silence on a WAV.
-
-    F5-TTS's `remove_silence=True` uses pydub's silence-detect which is
-    too conservative — it leaves ~150ms of low-amplitude breath/noise at
-    both ends. For seamless multi-chunk playback we want a much tighter
-    crop, then a tiny fade so the cut isn't a click.
-
-    Uses RMS-window scanning over 20ms windows. Strict but reliable.
+    min_trim_ms: int = 30,
+) -> int:
+    """Trim leading/trailing silence from the in-memory waveform F5-TTS
+    just returned, then overwrite the on-disk WAV ONLY if the crop is
+    larger than `min_trim_ms` total. Returns the (possibly cropped) length.
     """
-    audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio[:, 0]
-    if audio.size == 0:
-        return
+    import numpy as _np
+    a = audio if hasattr(audio, "shape") else _np.asarray(audio, dtype=_np.float32)
+    if a.ndim > 1:
+        a = a[:, 0]
+    if a.size == 0:
+        return 0
 
-    win = max(1, int(sr * 0.020))  # 20ms windows
-    # Compute per-window RMS
-    n_full = (len(audio) // win) * win
+    win = max(1, int(sr * 0.020))
+    n_full = (a.size // win) * win
     if n_full < win:
-        return  # too short to bother
-    rms = np.sqrt(np.mean(audio[:n_full].reshape(-1, win).astype(np.float64) ** 2, axis=1) + 1e-12)
-    rms_db = 20.0 * np.log10(rms + 1e-12)
+        return a.size
 
-    # find first window above head_db
-    voiced = np.where(rms_db > head_db)[0]
+    rms = _np.sqrt(_np.mean(a[:n_full].reshape(-1, win).astype(_np.float64) ** 2, axis=1) + 1e-12)
+    rms_db = 20.0 * _np.log10(rms + 1e-12)
+    voiced = _np.where(rms_db > head_db)[0]
     if voiced.size == 0:
-        # whole clip is silent — leave it alone
-        return
-    start_w = voiced[0]
-    # find last window above tail_db
-    voiced_tail = np.where(rms_db > tail_db)[0]
-    end_w = voiced_tail[-1] + 1
+        return a.size
 
-    start = start_w * win
-    end = min(end_w * win, len(audio))
-    cropped = audio[start:end]
+    start = int(voiced[0]) * win
+    voiced_tail = _np.where(rms_db > tail_db)[0]
+    end = min((int(voiced_tail[-1]) + 1) * win, a.size)
 
-    # short fade in / out so the boundary cut isn't audible as a click
-    fade_samples = max(1, int(sr * fade_ms / 1000.0))
-    if cropped.size > 2 * fade_samples:
-        ramp = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-        cropped[:fade_samples] *= ramp
-        cropped[-fade_samples:] *= ramp[::-1]
+    cut_total_ms = (start + (a.size - end)) * 1000 / sr
+    if cut_total_ms < min_trim_ms:
+        return a.size                       # not worth a rewrite
+
+    cropped = a[start:end].copy()
+    fade = max(1, int(sr * fade_ms / 1000.0))
+    if cropped.size > 2 * fade:
+        ramp = _np.linspace(0.0, 1.0, fade, dtype=_np.float32)
+        cropped[:fade] *= ramp
+        cropped[-fade:] *= ramp[::-1]
 
     sf.write(str(wav_path), cropped, sr)
+    return cropped.size
 
 
 # ---------- sentence-level streaming ----------

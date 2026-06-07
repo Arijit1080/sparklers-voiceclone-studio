@@ -133,7 +133,7 @@ class SpeakReq(BaseModel):
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     base_speaker: str = Field(default="F5-Base")    # unused under F5-TTS
     tau: float = Field(default=3.0, ge=0.0, le=10.0)  # F5-TTS cfg_strength
-    nfe_step: int = Field(default=16, ge=8, le=128)   # F5-TTS flow steps
+    nfe_step: int = Field(default=8, ge=4, le=128)    # F5-TTS flow steps
 
 
 class DeleteReq(BaseModel):
