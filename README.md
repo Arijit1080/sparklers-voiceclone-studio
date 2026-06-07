@@ -9,10 +9,9 @@ anything you type.
 - 🧠 **F5-TTS v1** (flow-matching + DiT) as the synth model, on CUDA
 - 🤖 **Whisper-small.en** auto-transcribes the reference clip
 - ⚡ Sub-realtime synth at NFE 16 (RTF ≈ 0.76 on Orin Nano Super 8 GB)
-- 🔊 Playback on the Mac (browser) OR on the Jetson's USB speaker
-- 🖥 FastAPI + HTMX + SSE — clean web UI, no NPM, no React
+- 🔊 Playback in the browser (Mac) OR on the Jetson's USB speaker
+- 🖥 FastAPI + HTMX + SSE web UI — no NPM, no React
 - 📊 Live tegrastats dashboard (CPU/GPU/RAM/swap/temps/power)
-- 🐳 Native ARM64 Docker image
 - 🪶 100 % offline at runtime, MIT-licensed
 
 ---
@@ -89,34 +88,6 @@ These are the defaults baked into the UI — change at your own risk.
 
 ---
 
-## Quick start (recommended — Docker)
-
-> **Prerequisites:** Jetson Orin Nano with **JetPack 6.x** (L4T R36.x), Docker, and `docker-compose-plugin`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Arijit1080/sparklers-voiceclone-studio/main/install.sh | bash
-```
-
-That:
-1. fetches `docker-compose.yml` into `~/sparklers-voiceclone-studio/`
-2. pulls `ghcr.io/arijit1080/sparklers-voiceclone-studio:latest`
-3. brings the container up with NVIDIA runtime, ALSA pass-through, and tegrastats bind-mount
-4. waits for `/healthz` and prints the UI URL
-
-Then open `http://<jetson-ip>:8083`.
-
-```bash
-# manage:
-cd ~/sparklers-voiceclone-studio
-docker compose logs -f
-docker compose down
-
-# wipe enrolled voices:
-docker volume rm sparklers_vc_data sparklers_vc_models
-```
-
----
-
 ## Hardware
 
 | Part                | Notes                                                                  |
@@ -129,9 +100,11 @@ F5-TTS draws ~6-8 W during synth; idle ~3 W.
 
 ---
 
-## Manual install (no Docker)
+## Installation
 
-For when you want to hack on the source.
+> **Prerequisites:** Jetson Orin Nano with **JetPack 6.x** (L4T R36.x),
+> CUDA 12.6, Python 3.10. The whole setup takes ~15 min plus model
+> downloads (~2 GB).
 
 ### 1. System packages
 
@@ -146,7 +119,7 @@ sudo apt install -y \
 
 ### 2. USB audio codec
 
-Plug it in, list devices, confirm the index:
+Plug it in, confirm the indices:
 
 ```bash
 arecord -l       # input devices
@@ -158,6 +131,12 @@ Tune gains if needed:
 
 ```bash
 alsamixer        # set Mic / Speaker, then 'sudo alsactl store' to persist
+```
+
+If your USB codec isn't device 0, export the index before launching:
+
+```bash
+export SPARKLERS_AUDIO_IN=1
 ```
 
 ### 3. Clone + venv
@@ -173,7 +152,7 @@ pip install --upgrade pip wheel setuptools
 pip install 'numpy<2'
 ```
 
-### 4. PyTorch + torchaudio for Jetson JP6 / CUDA 12.6
+### 4. PyTorch + torchaudio for Jetson (CUDA 12.6)
 
 The PyPI wheels are CPU-only on ARM. Use the
 [jetson-ai-lab.io](https://pypi.jetson-ai-lab.io) wheels by exact URL —
@@ -188,6 +167,8 @@ pip install \
 python -c "import torch; print('cuda:', torch.cuda.is_available(), 'device:', torch.cuda.get_device_name(0))"
 ```
 
+Expected: `cuda: True  device: Orin`.
+
 ### 5. PyAV (prebuilt aarch64 wheel — avoids the ffmpeg-header source build)
 
 ```bash
@@ -197,7 +178,7 @@ pip install "av>=12,<14"
 ### 6. The rest of the Python deps
 
 ```bash
-pip install -r docker/requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 7. Vendor F5-TTS + apply Tegra allocator patches
@@ -222,10 +203,12 @@ pip install --no-build-isolation --no-deps -e vendor/F5-TTS
 ```bash
 python - <<'PY'
 from huggingface_hub import hf_hub_download
-print("F5-TTS v1 base…");      hf_hub_download("SWivid/F5-TTS", "F5TTS_v1_Base/model_1250000.safetensors")
-print("Vocos mel-24kHz…");     hf_hub_download("charactr/vocos-mel-24khz", "config.yaml")
+print("F5-TTS v1 base (~1.4 GB)…")
+hf_hub_download("SWivid/F5-TTS", "F5TTS_v1_Base/model_1250000.safetensors")
+print("Vocos mel-24kHz vocoder…")
+hf_hub_download("charactr/vocos-mel-24khz", "config.yaml")
 hf_hub_download("charactr/vocos-mel-24khz", "pytorch_model.bin")
-print("Whisper small.en…")
+print("Whisper small.en (~244 MB)…")
 from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 AutoProcessor.from_pretrained("openai/whisper-small.en")
 AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-small.en")
@@ -233,9 +216,9 @@ print("done")
 PY
 ```
 
-### 9. Set the magic env vars + run
+### 9. Run
 
-Tegra's NVML probes break PyTorch's caching allocator. Two env vars
+Tegra's NVML probes break PyTorch's caching allocator. These env vars
 disable the broken paths and `expandable_segments:True` keeps the
 allocator from fragmenting:
 
@@ -247,7 +230,8 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_thre
 uvicorn web.app:app --host 0.0.0.0 --port 8083
 ```
 
-Open `http://<jetson-ip>:8083`.
+Open `http://<jetson-ip>:8083`. First synth takes ~15 s (model warmup);
+subsequent calls run at the RTF in the settings table.
 
 ### 10. (Optional) systemd unit
 
@@ -277,6 +261,28 @@ sudo systemctl enable --now sparklers-vc
 
 ---
 
+## CLI smoke test
+
+If you don't want the web UI:
+
+```bash
+source .venv/bin/activate
+export PYTORCH_NO_NVML=1
+export PYTORCH_NVML_BASED_CUDA_CHECK=0
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+# Live-mic enroll (30 s window)
+python tools/smoke_test.py enroll  --name "Arijit" --seconds 30
+
+# List voices
+python tools/smoke_test.py list
+
+# Synthesize and play through the Jetson speaker
+python tools/smoke_test.py speak --voice arijit --text "Hello from Jetson" --play
+```
+
+---
+
 ## How it works
 
 **Enroll** — capture (or upload) 30 s of audio at 16 kHz mono, run
@@ -298,12 +304,12 @@ OpenVoice. Trade-off: synthesis pays the encoder cost every time.
 
 ---
 
-## Why the Dockerfile has patches
+## Why the patches under `tools/`
 
 F5-TTS's `load_checkpoint()` builds a fresh 1.4 GB CFM model on CUDA and
 then loads the safetensors as a CUDA dict. On Tegra's unified memory,
 that triggers the NVML caching-allocator INTERNAL ASSERT FAILED at
-`CUDACachingAllocator.cpp:1131`. The two patches in `tools/`:
+`CUDACachingAllocator.cpp:1131`. The two patches:
 
 1. **`patch_f5_load.py`** — load safetensors on CPU first, not CUDA. Stops
    the dict from doubling memory.
