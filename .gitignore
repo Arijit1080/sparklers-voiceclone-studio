@@ -1,0 +1,21 @@
+# Local runtime
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Trained/enrolled voices stay local
+data/
+models/
+
+# Vendored third-party code (cloned at install time)
+vendor/
+
+# Logs
+*.log
+
+# OS / IDE
+.vscode/
+.idea/

@@ -1,0 +1,326 @@
+# ✨ Sparklers VoiceClone Studio
+
+State-of-the-art **English voice cloning** that runs entirely on an
+NVIDIA Jetson Orin Nano. Give it 30 seconds of someone's voice — through
+the live mic or by dropping in a WAV — and it'll make that voice say
+anything you type.
+
+- 🎙 Two enrollment paths: live USB-mic capture or drag-and-drop audio file
+- 🧠 **F5-TTS v1** (flow-matching + DiT) as the synth model, on CUDA
+- 🤖 **Whisper-small.en** auto-transcribes the reference clip
+- ⚡ Sub-realtime synth at NFE 16 (RTF ≈ 0.76 on Orin Nano Super 8 GB)
+- 🔊 Playback on the Mac (browser) OR on the Jetson's USB speaker
+- 🖥 FastAPI + HTMX + SSE — clean web UI, no NPM, no React
+- 📊 Live tegrastats dashboard (CPU/GPU/RAM/swap/temps/power)
+- 🐳 Native ARM64 Docker image
+- 🪶 100 % offline at runtime, MIT-licensed
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td><img src="docs/images/home.png"      alt="home"      width="400"></td>
+    <td><img src="docs/images/enroll.png"    alt="enroll"    width="400"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/speak.png"     alt="speak"     width="400"></td>
+    <td><img src="docs/images/dashboard.png" alt="dashboard" width="400"></td>
+  </tr>
+</table>
+
+---
+
+## Architecture
+
+```
+                ┌────────────────────────────────────┐
+   USB mic  ──► │  audio.io  (sounddevice 16 kHz)    │──► raw 30 s WAV
+   or WAV   ──► │  audio.vad (webrtcvad trim)        │──► trimmed
+   upload       │  voice.enroll  (centered 8 s crop) │──► 8 s reference
+                │  Whisper-small.en  (on CPU)        │──► transcript
+                └────────────────────────────────────┘
+                                │
+                                ▼
+                       saved to disk per voice
+
+                          ─────── enroll ───────
+
+
+   text ──►  ┌────────────────────────────────────────┐
+             │  F5-TTS v1 (flow-matching + DiT, CUDA) │──► 24 kHz mono WAV
+             │  conditioned on (ref WAV + transcript) │    in the cloned voice
+             └────────────────────────────────────────┘
+                                │
+                ┌───────────────┴────────────────┐
+                ▼                                ▼
+        Browser <audio>                  ALSA → USB speaker
+                                         (server-side aplay)
+                          ─────── speak  ───────
+```
+
+Each call re-encodes the reference; that's why F5-TTS sounds dramatically
+closer to the speaker than fixed-embedding models like OpenVoice. The
+trade-off is no pre-extracted SE — synthesis carries the conditioning
+cost on every call.
+
+---
+
+## Best-results settings
+
+These are the defaults baked into the UI — change at your own risk.
+
+| Setting               | Value             | Why                                                                   |
+|-----------------------|-------------------|-----------------------------------------------------------------------|
+| Reference clip        | **30 s** raw      | We VAD-trim and crop the centered **8 s** — F5-TTS's sweet spot.      |
+| VAD aggressiveness    | 2 (webrtc)        | Drops breath/silence without chopping consonants.                     |
+| ASR for ref text      | **whisper-small.en** on CPU | tiny.en mis-hears, small.en is reliable; CPU keeps GPU free for F5.   |
+| `nfe_step`            | **16** ⭐         | RTF ≈ 0.76. Indistinguishable from 32 in blind A/B. 8 is faster still. |
+| `cfg_strength` (tau)  | **3.0**           | Higher than F5-TTS default (2.0). Closer to enrolled voice.          |
+| `sway_sampling_coef`  | -1.0              | Official F5-TTS recommendation.                                       |
+| `speed`               | 1.0               | Anything else degrades clone similarity.                              |
+
+**For best clone quality**, when recording the reference:
+- Mic ~20–25 cm from your mouth
+- Quiet room — close windows, kill fans
+- Conversational tone, not narrator voice
+- Speak continuously through the full window — no long pauses
+
+---
+
+## Quick start (recommended — Docker)
+
+> **Prerequisites:** Jetson Orin Nano with **JetPack 6.x** (L4T R36.x), Docker, and `docker-compose-plugin`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Arijit1080/sparklers-voiceclone-studio/main/install.sh | bash
+```
+
+That:
+1. fetches `docker-compose.yml` into `~/sparklers-voiceclone-studio/`
+2. pulls `ghcr.io/arijit1080/sparklers-voiceclone-studio:latest`
+3. brings the container up with NVIDIA runtime, ALSA pass-through, and tegrastats bind-mount
+4. waits for `/healthz` and prints the UI URL
+
+Then open `http://<jetson-ip>:8083`.
+
+```bash
+# manage:
+cd ~/sparklers-voiceclone-studio
+docker compose logs -f
+docker compose down
+
+# wipe enrolled voices:
+docker volume rm sparklers_vc_data sparklers_vc_models
+```
+
+---
+
+## Hardware
+
+| Part                | Notes                                                                  |
+|---------------------|------------------------------------------------------------------------|
+| Jetson Orin Nano 8 GB Super | Tested target. CUDA 12.6 / JetPack 6.2 (L4T R36.4).            |
+| USB audio codec     | Waveshare USB Audio Codec or any class-compliant device. Mic + speaker on the same device is easiest. |
+| Power supply        | Stay on **MAXN SUPER** (`sudo nvpmodel -m 0`) for best RTF.            |
+
+F5-TTS draws ~6-8 W during synth; idle ~3 W.
+
+---
+
+## Manual install (no Docker)
+
+For when you want to hack on the source.
+
+### 1. System packages
+
+```bash
+sudo apt update
+sudo apt install -y \
+    python3 python3-venv python3-dev \
+    libopenblas0-pthread libsndfile1 ffmpeg \
+    alsa-utils libasound2-plugins libportaudio2 \
+    unzip wget git
+```
+
+### 2. USB audio codec
+
+Plug it in, list devices, confirm the index:
+
+```bash
+arecord -l       # input devices
+aplay   -l       # output devices
+python3 -c "import sounddevice as sd; [print(i, d['name']) for i,d in enumerate(sd.query_devices()) if d['max_input_channels']>0]"
+```
+
+Tune gains if needed:
+
+```bash
+alsamixer        # set Mic / Speaker, then 'sudo alsactl store' to persist
+```
+
+### 3. Clone + venv
+
+```bash
+git clone https://github.com/Arijit1080/sparklers-voiceclone-studio.git
+cd sparklers-voiceclone-studio
+
+python3 -m venv .venv --system-site-packages
+source .venv/bin/activate
+
+pip install --upgrade pip wheel setuptools
+pip install 'numpy<2'
+```
+
+### 4. PyTorch + torchaudio for Jetson JP6 / CUDA 12.6
+
+The PyPI wheels are CPU-only on ARM. Use the
+[jetson-ai-lab.io](https://pypi.jetson-ai-lab.io) wheels by exact URL —
+pip would otherwise prefer the PyPI CPU build because of the version
+collision:
+
+```bash
+pip install \
+  "https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl" \
+  "https://pypi.jetson-ai-lab.io/jp6/cu126/+f/81a/775c8af36ac85/torchaudio-2.8.0-cp310-cp310-linux_aarch64.whl"
+
+python -c "import torch; print('cuda:', torch.cuda.is_available(), 'device:', torch.cuda.get_device_name(0))"
+```
+
+### 5. PyAV (prebuilt aarch64 wheel — avoids the ffmpeg-header source build)
+
+```bash
+pip install "av>=12,<14"
+```
+
+### 6. The rest of the Python deps
+
+```bash
+pip install -r docker/requirements.txt
+```
+
+### 7. Vendor F5-TTS + apply Tegra allocator patches
+
+F5-TTS's stock `load_checkpoint()` triggers Tegra's NVML caching-allocator
+assert (`CUDACachingAllocator.cpp:1131`) because of how the 1.4 GB
+safetensors get staged into GPU memory. Two small patches fix it; both
+are committed to this repo under `tools/`:
+
+```bash
+mkdir -p vendor
+git clone --depth=1 https://github.com/SWivid/F5-TTS vendor/F5-TTS
+
+python tools/patch_f5_load.py    vendor/F5-TTS/src/f5_tts/infer/utils_infer.py
+python tools/patch_f5_load_v4.py vendor/F5-TTS/src/f5_tts/infer/utils_infer.py
+
+pip install --no-build-isolation --no-deps -e vendor/F5-TTS
+```
+
+### 8. Pre-download model checkpoints (one-time, online)
+
+```bash
+python - <<'PY'
+from huggingface_hub import hf_hub_download
+print("F5-TTS v1 base…");      hf_hub_download("SWivid/F5-TTS", "F5TTS_v1_Base/model_1250000.safetensors")
+print("Vocos mel-24kHz…");     hf_hub_download("charactr/vocos-mel-24khz", "config.yaml")
+hf_hub_download("charactr/vocos-mel-24khz", "pytorch_model.bin")
+print("Whisper small.en…")
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+AutoProcessor.from_pretrained("openai/whisper-small.en")
+AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-small.en")
+print("done")
+PY
+```
+
+### 9. Set the magic env vars + run
+
+Tegra's NVML probes break PyTorch's caching allocator. Two env vars
+disable the broken paths and `expandable_segments:True` keeps the
+allocator from fragmenting:
+
+```bash
+export PYTORCH_NO_NVML=1
+export PYTORCH_NVML_BASED_CUDA_CHECK=0
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.6"
+
+uvicorn web.app:app --host 0.0.0.0 --port 8083
+```
+
+Open `http://<jetson-ip>:8083`.
+
+### 10. (Optional) systemd unit
+
+```bash
+sudo tee /etc/systemd/system/sparklers-vc.service >/dev/null <<EOF
+[Unit]
+Description=Sparklers VoiceClone Studio
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=/home/$USER/sparklers-voiceclone-studio
+Environment=PYTORCH_NO_NVML=1
+Environment=PYTORCH_NVML_BASED_CUDA_CHECK=0
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6
+ExecStart=/home/$USER/sparklers-voiceclone-studio/.venv/bin/uvicorn web.app:app --host 0.0.0.0 --port 8083
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now sparklers-vc
+```
+
+---
+
+## How it works
+
+**Enroll** — capture (or upload) 30 s of audio at 16 kHz mono, run
+webrtcvad to trim silence, crop a centered 8 s window (F5-TTS's
+sweet spot), then auto-transcribe the cropped clip with
+`openai/whisper-small.en` on CPU. The reference WAV + transcript are
+persisted per voice.
+
+**Speak** — at every synth call, `F5TTS.infer()` reads the reference WAV
+and transcript and generates the target text in that voice. Flow-matching
+with NFE steps (16 default, configurable 8–48 in the UI) and DiT
+backbone produce a 24 kHz mono WAV. Post-process strips leading/trailing
+silence with a 20 ms RMS-windowed scan so the output starts and ends on
+the first/last voiced sample.
+
+Each call re-encodes the reference — that's the model's design and why
+similarity is dramatically better than fixed-embedding approaches like
+OpenVoice. Trade-off: synthesis pays the encoder cost every time.
+
+---
+
+## Why the Dockerfile has patches
+
+F5-TTS's `load_checkpoint()` builds a fresh 1.4 GB CFM model on CUDA and
+then loads the safetensors as a CUDA dict. On Tegra's unified memory,
+that triggers the NVML caching-allocator INTERNAL ASSERT FAILED at
+`CUDACachingAllocator.cpp:1131`. The two patches in `tools/`:
+
+1. **`patch_f5_load.py`** — load safetensors on CPU first, not CUDA. Stops
+   the dict from doubling memory.
+2. **`patch_f5_load_v4.py`** — build CFM on CPU, only move to CUDA after
+   the state-dict is fully loaded and converted to fp16. One big
+   ~700 MB `.to(cuda)` instead of dozens of small fragmenting ones.
+
+Combined with `PYTORCH_NO_NVML=1`, F5-TTS loads cleanly on Jetson.
+
+---
+
+## Acknowledgements
+
+- [SWivid · F5-TTS](https://github.com/SWivid/F5-TTS) — flow-matching TTS (MIT)
+- [charactr · Vocos](https://github.com/gemelo-ai/vocos) — neural vocoder
+- [OpenAI · Whisper](https://github.com/openai/whisper) — speech-to-text
+- [Jetson AI Lab](https://pypi.jetson-ai-lab.io) — JP6 / CU126 PyTorch wheels
+- [tegrastats](https://docs.nvidia.com/jetson/archives/r36.4/DeveloperGuide/AT/JetsonLinuxDevelopmentTools/JetsonStats.html) — host system telemetry
+
+License: [MIT](./LICENSE).

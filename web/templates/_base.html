@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sparklers VoiceClone Studio — {{ active|default('home') }}</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #161a23;
+      --panel-2: #1b2030;
+      --border: #2a3145;
+      --text: #e9ecf1;
+      --muted: #8892a8;
+      --accent: #ffb84a;
+      --accent-2: #f0507a;
+      --good: #4dd49a;
+      --warn: #ffb84a;
+      --bad:  #ff5f6e;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                                   Roboto, "Helvetica Neue", Arial, sans-serif;
+           background: var(--bg); color: var(--text); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header {
+      display: flex; align-items: center; gap: 24px;
+      padding: 14px 28px;
+      background: linear-gradient(180deg, #1a1f2c, #0f1117);
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 50;
+    }
+    header h1 { font-size: 18px; margin: 0; letter-spacing: 0.3px; }
+    header nav { display: flex; gap: 4px; margin-left: auto; }
+    header nav a {
+      padding: 6px 12px; border-radius: 8px; color: var(--muted);
+      font-size: 14px;
+    }
+    header nav a.on { background: var(--panel-2); color: var(--text); }
+    main { max-width: 1100px; margin: 32px auto; padding: 0 24px; }
+    h2 { margin-top: 0; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 14px; padding: 22px; margin-bottom: 22px;
+    }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1 1 240px; min-width: 220px; }
+    label { display: block; font-size: 13px; color: var(--muted);
+            margin-bottom: 6px; }
+    input[type=text], input[type=number], select, textarea {
+      width: 100%; padding: 10px 12px; font-size: 15px;
+      background: #0c0f17; border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text);
+    }
+    textarea { min-height: 110px; resize: vertical; font-family: inherit; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 10px 16px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--accent); color: #1a0d00;
+      font-weight: 600; font-size: 14px; cursor: pointer;
+    }
+    .btn:hover { filter: brightness(1.05); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn.secondary { background: var(--panel-2); color: var(--text); }
+    .btn.small { padding: 4px 10px; font-size: 12px; }
+    .btn.danger { background: var(--bad); color: #200; }
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 14px; }
+    th { color: var(--muted); font-weight: 600; }
+    .meter, .progress {
+      height: 10px; background: #0c0f17; border-radius: 6px; overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .meter > div, .progress > div {
+      height: 100%; background: linear-gradient(90deg, var(--good), var(--accent), var(--bad));
+      width: 0%; transition: width 0.12s linear;
+    }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+            font-size: 12px; background: var(--panel-2); color: var(--muted); }
+    .pill.live { background: var(--bad); color: #fff; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: 0.55; } }
+    .log {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12.5px; line-height: 1.5; color: var(--muted);
+      max-height: 180px; overflow: auto;
+      padding: 10px 12px; background: #0c0f17; border: 1px solid var(--border);
+      border-radius: 8px; white-space: pre-wrap;
+    }
+    .grid-bars {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(36px, 1fr));
+      gap: 4px;
+    }
+    .grid-bars > div {
+      height: 32px; background: #0c0f17; border: 1px solid var(--border);
+      border-radius: 4px; position: relative; overflow: hidden;
+    }
+    .grid-bars > div > span {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      background: var(--accent); transition: height 0.2s ease;
+    }
+    .grid-bars > div::after {
+      content: attr(data-label); position: absolute;
+      top: 50%; left: 50%; transform: translate(-50%, -50%);
+      font-size: 9px; color: var(--muted); mix-blend-mode: difference;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>✨ Sparklers VoiceClone Studio</h1>
+    <nav>
+      <a href="/"          class="{% if active=='home'      %}on{% endif %}">Home</a>
+      <a href="/enroll"    class="{% if active=='enroll'    %}on{% endif %}">Enroll</a>
+      <a href="/speak"     class="{% if active=='speak'     %}on{% endif %}">Speak</a>
+      <a href="/dashboard" class="{% if active=='dashboard' %}on{% endif %}">Dashboard</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    // Toast helper used by all pages.
+    function toast(msg, kind='') {
+      const el = document.createElement('div');
+      el.textContent = msg;
+      el.style.cssText = `
+        position:fixed;right:24px;bottom:24px;z-index:200;
+        background:${kind==='bad'?'#3a1620':'#162a3a'};
+        border:1px solid ${kind==='bad'?'#ff5f6e':'#4dd49a'};
+        color:#e9ecf1;padding:10px 14px;border-radius:10px;
+        font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,0.5);
+        animation:fadein 0.18s ease;`;
+      document.body.appendChild(el);
+      setTimeout(() => el.remove(), 4000);
+    }
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

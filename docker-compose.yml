@@ -1,0 +1,57 @@
+# Sparklers VoiceClone Studio — production compose.
+#
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+#
+# Open the UI at http://<jetson-ip>:8083
+
+services:
+  sparklers-vc:
+    image: ghcr.io/arijit1080/sparklers-voiceclone-studio:latest
+    container_name: sparklers-vc
+    hostname: sparklers-vc
+    restart: unless-stopped
+
+    # ────────────────────────────────────────────────────────────────
+    # NVIDIA runtime — gives the container access to the Orin GPU.
+    # Requires nvidia-container-toolkit on the host (ships with JetPack).
+    # Without this, MeloTTS + OpenVoice fall back to CPU → ~80× RTF.
+    # ────────────────────────────────────────────────────────────────
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      # PyTorch on Tegra: NVML probes can mis-report and trip the caching
+      # allocator (CUDACachingAllocator.cpp:1131 INTERNAL ASSERT FAILED).
+      # NO_NVML=1 is the magic one for loading >256 MB models like F5-TTS.
+      PYTORCH_NVML_BASED_CUDA_CHECK: "0"
+      PYTORCH_NO_NVML: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,garbage_collection_threshold:0.6"
+
+    # ALSA pass-through for the USB audio codec.
+    devices:
+      - /dev/snd:/dev/snd
+
+    group_add:
+      - audio
+
+    # tegrastats binary + /sys it reads come from the host BSP, not from
+    # any apt package.  Bind-mount them so the dashboard's CPU/GPU/RAM
+    # panel works inside the container.
+    volumes:
+      - /usr/bin/tegrastats:/usr/bin/tegrastats:ro
+      - /sys:/sys:ro
+      - sparklers_vc_data:/app/data
+      - sparklers_vc_models:/app/models
+
+    ports:
+      - "8083:8083"
+
+    stop_grace_period: 10s
+
+volumes:
+  sparklers_vc_data:
+    name: sparklers_vc_data
+  sparklers_vc_models:
+    name: sparklers_vc_models

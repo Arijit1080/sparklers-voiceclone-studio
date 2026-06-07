@@ -1,0 +1,48 @@
+# Sparklers VoiceClone Studio — Python deps for the Docker image.
+# torch + torchaudio + numpy are installed in earlier Dockerfile layers.
+
+# F5-TTS runtime deps (we install F5-TTS itself --no-deps from the
+# vendored source tree so these explicit pins are what actually drives
+# the install).
+ema_pytorch>=0.5.2
+x_transformers>=1.31.14
+torchdiffeq>=0.2.5
+vocos>=0.1.0
+safetensors>=0.4.0
+accelerate>=0.33.0
+tomli
+hydra-core>=1.3.0
+click
+transformers_stream_generator
+rjieba
+matplotlib
+wandb
+datasets
+
+# Audio I/O
+soundfile
+librosa==0.9.1
+sounddevice>=0.4
+webrtcvad>=2.0
+pydub==0.25.1
+
+# Whisper reference transcription (via HF transformers)
+transformers>=4.27,<5
+# Phoneme/text utilities used transitively
+eng_to_ipa==0.0.2
+inflect==7.0.0
+unidecode==1.3.7
+num2words==0.5.12
+
+# Web stack
+fastapi>=0.110
+uvicorn[standard]>=0.27
+jinja2>=3.1
+python-multipart>=0.0.9
+sse-starlette>=2.0
+
+# HF hub for downloads
+huggingface_hub>=0.20
+
+# Prebuilt aarch64 wheel so we don't need ffmpeg headers to build PyAV.
+av>=12.0.0,<14

@@ -1,0 +1,166 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="card">
+  <h2>System monitor</h2>
+  <p class="small muted">Live tegrastats — updates every second.</p>
+
+  <div class="row">
+    <div class="col">
+      <label>CPU avg</label>
+      <div class="meter"><div id="bar-cpu"></div></div>
+      <p class="small muted"><span id="cpu-pct">—</span> %  ·  cpu@<span id="cpu-temp">—</span>°C</p>
+    </div>
+    <div class="col">
+      <label>GPU (GR3D_FREQ)</label>
+      <div class="meter"><div id="bar-gpu"></div></div>
+      <p class="small muted"><span id="gpu-pct">—</span> %  ·  gpu@<span id="gpu-temp">—</span>°C</p>
+    </div>
+    <div class="col">
+      <label>RAM</label>
+      <div class="meter"><div id="bar-ram"></div></div>
+      <p class="small muted"><span id="ram-used">—</span> / <span id="ram-total">—</span> MB</p>
+    </div>
+    <div class="col">
+      <label>Swap</label>
+      <div class="meter"><div id="bar-swap"></div></div>
+      <p class="small muted"><span id="swap-used">—</span> / <span id="swap-total">—</span> MB</p>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:16px">
+    <div class="col" style="flex-basis:100%">
+      <label>Per-core CPU</label>
+      <div id="cores" class="grid-bars"></div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:16px">
+    <div class="col">
+      <label>Power — VDD_IN</label>
+      <p class="small muted"><span id="pwr-in">—</span> mW (avg <span id="pwr-in-avg">—</span> mW)</p>
+    </div>
+    <div class="col">
+      <label>Power — VDD_CPU_GPU_CV</label>
+      <p class="small muted"><span id="pwr-cg">—</span> mW</p>
+    </div>
+    <div class="col">
+      <label>Junction temp</label>
+      <p class="small muted">tj@<span id="tj-temp">—</span>°C</p>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Service</h2>
+  <p class="small muted">
+    Models loaded: <span class="pill" id="models-pill">{{ 'yes' if models_loaded else 'no' }}</span>
+    · Busy with: <span class="pill" id="busy-pill">—</span>
+    · Enrolled voices: <span class="pill" id="voice-count-pill">{{ voices|length }}</span>
+  </p>
+  <button id="warmup2" class="btn small secondary">warm up models</button>
+</div>
+
+<div class="card">
+  <h2>Event log</h2>
+  <div class="log" id="event-log"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('event-log');
+  function appendLog(line) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${line}\n`;
+    // cap at ~200 lines
+    const lines = logEl.textContent.split('\n');
+    if (lines.length > 200) logEl.textContent = lines.slice(-200).join('\n');
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setMeter(id, pct) { $(id).style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+
+  function renderCores(arr) {
+    const c = $('cores');
+    if (c.childElementCount !== arr.length) {
+      c.innerHTML = '';
+      arr.forEach((_, i) => {
+        const d = document.createElement('div');
+        d.dataset.label = `c${i}`;
+        d.innerHTML = '<span></span>';
+        c.appendChild(d);
+      });
+    }
+    arr.forEach((v, i) => {
+      c.children[i].firstElementChild.style.height = Math.max(0, Math.min(100, v)) + '%';
+    });
+  }
+
+  function renderSys(s) {
+    if (s.cpu_avg_pct !== undefined) { setMeter('bar-cpu', s.cpu_avg_pct); $('cpu-pct').textContent = s.cpu_avg_pct; }
+    if (s.gpu_pct     !== undefined) { setMeter('bar-gpu', s.gpu_pct);     $('gpu-pct').textContent = s.gpu_pct; }
+    if (s.cpu_temp_c  !== undefined) { $('cpu-temp').textContent = s.cpu_temp_c.toFixed(1); }
+    if (s.gpu_temp_c  !== undefined) { $('gpu-temp').textContent = s.gpu_temp_c.toFixed(1); }
+    if (s.tj_temp_c   !== undefined) { $('tj-temp').textContent  = s.tj_temp_c.toFixed(1); }
+    if (s.ram_used_mb !== undefined) {
+      setMeter('bar-ram', (s.ram_used_mb / s.ram_total_mb) * 100);
+      $('ram-used').textContent  = s.ram_used_mb;
+      $('ram-total').textContent = s.ram_total_mb;
+    }
+    if (s.swap_used_mb !== undefined) {
+      setMeter('bar-swap', (s.swap_used_mb / Math.max(1, s.swap_total_mb)) * 100);
+      $('swap-used').textContent  = s.swap_used_mb;
+      $('swap-total').textContent = s.swap_total_mb;
+    }
+    if (s.cpu_per_core) renderCores(s.cpu_per_core);
+    if (s.power_in_mw !== undefined)     $('pwr-in').textContent     = s.power_in_mw;
+    if (s.power_in_avg_mw !== undefined) $('pwr-in-avg').textContent = s.power_in_avg_mw;
+    if (s.power_cpu_gpu_mw !== undefined) $('pwr-cg').textContent    = s.power_cpu_gpu_mw;
+  }
+
+  const evt = new EventSource('/events');
+  evt.addEventListener('snapshot', e => {
+    const s = JSON.parse(e.data);
+    $('models-pill').textContent = s.models_loaded ? 'yes' : 'no';
+    $('busy-pill').textContent = s.busy_with || '—';
+    $('voice-count-pill').textContent = s.voices ?? '—';
+    if (s.sysstats) renderSys(s.sysstats);
+    appendLog(`SSE connected (busy=${s.busy_with || '-'})`);
+  });
+  evt.addEventListener('sysstats', e => renderSys(JSON.parse(e.data)));
+  evt.addEventListener('progress', e => {
+    const d = JSON.parse(e.data);
+    $('busy-pill').textContent = d.kind;
+    appendLog(`${d.kind}: ${d.message}`);
+  });
+  evt.addEventListener('synth', e => {
+    const d = JSON.parse(e.data);
+    appendLog(`synth voice=${d.voice_key} secs=${d.seconds} elapsed=${d.elapsed}s rtf=${d.rtf}`);
+  });
+  evt.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    $('busy-pill').textContent = '—';
+    appendLog(`done ${JSON.stringify(d.result)}`);
+    fetch('/api/status').then(r => r.json()).then(s => {
+      $('models-pill').textContent = s.models_loaded ? 'yes' : 'no';
+    });
+  });
+  evt.addEventListener('error', e => {
+    try {
+      const d = JSON.parse(e.data || '{}');
+      appendLog(`ERROR ${d.error || ''}`);
+    } catch {}
+  });
+
+  $('warmup2').addEventListener('click', async () => {
+    $('warmup2').disabled = true;
+    try {
+      const r = await fetch('/api/warmup', {method:'POST', headers:{'content-type':'application/json'}, body:'{}'});
+      if (!r.ok) throw new Error(await r.text());
+      toast('Warmup started…');
+    } catch (e) { toast(e.message, 'bad'); }
+    setTimeout(() => $('warmup2').disabled = false, 2000);
+  });
+</script>
+{% endblock %}

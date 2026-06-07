@@ -1,0 +1,84 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Enrolled voices</h2>
+  <p class="muted small">
+    Each voice is a 2.6 KB tone-color embedding extracted from a 30-second
+    reference clip. Enroll a new one from the
+    <a href="/enroll">Enroll</a> page, then make it talk from
+    <a href="/speak">Speak</a>.
+  </p>
+
+  {% if voices %}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Key</th>
+        <th>Ref. seconds</th>
+        <th>RMS (dBFS)</th>
+        <th>Voiced</th>
+        <th>Enrolled</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="voices-tbody">
+      {% for v in voices %}
+      <tr data-key="{{ v.key }}">
+        <td><strong>{{ v.display_name }}</strong></td>
+        <td><span class="pill">{{ v.key }}</span></td>
+        <td>{{ "%.1f"|format(v.seconds) }}</td>
+        <td>{{ "%.1f"|format(v.rms_dbfs) }}</td>
+        <td>{{ "%.0f"|format(v.voiced_ratio * 100) }}%</td>
+        <td class="small muted"
+            title="{{ v.enrolled_at }}">{{ (v.enrolled_at)|int }}</td>
+        <td style="text-align:right">
+          <a class="btn small secondary" href="/speak?voice={{ v.key }}">speak</a>
+          <button class="btn small danger del-voice"
+                  data-key="{{ v.key }}" data-name="{{ v.display_name }}">delete</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No voices enrolled yet. <a href="/enroll">Enroll one →</a></p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Quick start</h2>
+  <ol class="small muted" style="line-height:1.7">
+    <li>Plug in the USB audio codec (mic + speaker on the same device).</li>
+    <li>Go to <a href="/enroll">Enroll</a>, type a name, hit start, wait for the high beep, then speak continuously for 30 seconds.</li>
+    <li>Go to <a href="/speak">Speak</a>, pick the voice, type any English sentence, hit synth → audio plays through the speaker.</li>
+    <li>Check <a href="/dashboard">Dashboard</a> for live tegrastats while you train and synth.</li>
+  </ol>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.querySelectorAll('button.del-voice').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key  = btn.dataset.key;
+      const name = btn.dataset.name;
+      if (!confirm(`Delete voice "${name}"? This cannot be undone.`)) return;
+      btn.disabled = true;
+      const r = await fetch('/api/voice/delete', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({voice_key: key}),
+      });
+      if (r.ok) {
+        btn.closest('tr').remove();
+        toast(`Deleted ${name}`);
+      } else {
+        const e = await r.json().catch(() => ({detail: r.statusText}));
+        toast(`Delete failed: ${e.detail || r.statusText}`, 'bad');
+        btn.disabled = false;
+      }
+    });
+  });
+</script>
+{% endblock %}

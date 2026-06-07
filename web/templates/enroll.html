@@ -1,0 +1,296 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Enroll a new voice</h2>
+  <p class="muted small">
+    Speak <strong>continuously and naturally</strong> for the full window — F5-TTS conditions
+    on this audio at every synth call, so quality of clone = quality of this recording.
+  </p>
+
+  <details style="margin-bottom:14px">
+    <summary class="muted small" style="cursor:pointer">Tips for best clone quality ⭐</summary>
+    <ul class="small muted" style="line-height:1.7">
+      <li>Mic ~20–25 cm (about a hand-span) from your mouth — closer makes plosives pop, farther sounds hollow</li>
+      <li>Quiet room — close windows, kill fans, no music</li>
+      <li>Use your <em>conversational</em> voice, not "narrator" voice</li>
+      <li>No long pauses, no "umm/uhh", no laughs (VAD trims silence but it's better to just keep going)</li>
+      <li>If you stumble, keep going — we crop to the middle 8 s automatically</li>
+    </ul>
+  </details>
+
+  <p class="small muted" style="margin-top:-4px">
+    Say anything you want — natural conversation, intro, story, anything. Whisper transcribes it
+    automatically and F5-TTS conditions on it at synth time.
+  </p>
+
+  <div class="row">
+    <div class="col">
+      <label for="name">Voice name</label>
+      <input id="name" type="text" placeholder="Arijit" maxlength="64" required>
+    </div>
+    <div class="col">
+      <label for="seconds">Recording length (seconds)</label>
+      <input id="seconds" type="number" value="30" min="3" max="120" step="1">
+    </div>
+    <div class="col" style="display:flex;align-items:flex-end">
+      <button id="start" class="btn">Start recording</button>
+    </div>
+  </div>
+
+  <hr style="border:none;border-top:1px dashed var(--border);margin:22px 0">
+
+  <label>Or upload an existing WAV / MP3 / FLAC / OGG / M4A</label>
+  <div id="dropzone"
+       style="border:2px dashed var(--border);border-radius:10px;padding:24px;
+              text-align:center;cursor:pointer;background:#0c0f17;
+              transition:border-color 0.15s, background 0.15s">
+    <div class="small muted" id="dropzone-text">
+      Drag &amp; drop a file here, or <strong>click to browse</strong>.<br>
+      The file is staged on the Jetson, resampled to 16&nbsp;kHz mono, VAD-trimmed,
+      and transcribed by Whisper.
+    </div>
+    <input id="file-input" type="file"
+           accept=".wav,.mp3,.flac,.ogg,.m4a,audio/*"
+           style="display:none">
+  </div>
+  <div id="dropzone-selected" class="small muted" style="margin-top:8px"></div>
+  <button id="upload" class="btn secondary" style="margin-top:10px" disabled>Upload &amp; enroll</button>
+</div>
+
+<div class="card" id="live-card" style="display:none">
+  <h2 style="display:flex;align-items:center;gap:12px">
+    <span id="status-pill" class="pill">starting…</span>
+    <span id="status-msg" class="muted small"></span>
+  </h2>
+
+  <label>Microphone level</label>
+  <div class="meter"><div id="meter-bar"></div></div>
+  <p class="small muted">Last reading: <span id="meter-db">—</span> dBFS</p>
+
+  <label style="margin-top:14px">Progress</label>
+  <div class="progress"><div id="progress-bar"></div></div>
+  <p class="small muted"><span id="progress-pct">0%</span></p>
+
+  <label style="margin-top:14px">Event log</label>
+  <div class="log" id="event-log"></div>
+</div>
+
+<div class="card" id="result-card" style="display:none">
+  <h2>Enrollment complete ✨</h2>
+  <p id="result-summary" class="small"></p>
+
+  <label style="margin-top:14px">Whisper heard you say:</label>
+  <blockquote id="result-transcript"
+              style="background:#0c0f17;border:1px solid #2a3145;border-radius:8px;
+                     padding:12px 16px;margin:6px 0;font-style:italic;
+                     min-height:1.5em;line-height:1.5"></blockquote>
+  <p class="small muted">If this is clearly wrong (typos, missing words), re-record in a quieter
+     room with the mic closer — F5-TTS uses this transcript at every synth.</p>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+    <a id="goto-speak" class="btn">Open in Speak →</a>
+    <button id="reenroll" class="btn secondary">Re-record</button>
+    <a class="btn secondary" href="/">Back to home</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const startBtn  = document.getElementById('start');
+  const nameEl    = document.getElementById('name');
+  const secondsEl = document.getElementById('seconds');
+  const liveCard  = document.getElementById('live-card');
+  const resCard   = document.getElementById('result-card');
+  const statusPill = document.getElementById('status-pill');
+  const statusMsg  = document.getElementById('status-msg');
+  const meterBar   = document.getElementById('meter-bar');
+  const meterDb    = document.getElementById('meter-db');
+  const progBar    = document.getElementById('progress-bar');
+  const progPct    = document.getElementById('progress-pct');
+  const logEl      = document.getElementById('event-log');
+
+  let evtSrc = null;
+  let currentJob = null;
+
+  function appendLog(line) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent += `[${t}] ${line}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function openStream() {
+    if (evtSrc) return;
+    evtSrc = new EventSource('/events');
+    evtSrc.addEventListener('snapshot', e => {
+      const s = JSON.parse(e.data);
+      appendLog(`connected (busy=${s.busy_with || '-'})`);
+    });
+    evtSrc.addEventListener('progress', e => {
+      const d = JSON.parse(e.data);
+      if (currentJob && d.job_id !== currentJob) return;
+      statusPill.textContent = d.state;
+      statusPill.classList.toggle('live', d.state === 'running');
+      statusMsg.textContent = d.message;
+      const pct = Math.round((d.progress || 0) * 100);
+      progBar.style.width = pct + '%';
+      progPct.textContent = pct + '%';
+      appendLog(`progress ${pct}% — ${d.message}`);
+    });
+    evtSrc.addEventListener('meter', e => {
+      const d = JSON.parse(e.data);
+      if (currentJob && d.job_id !== currentJob) return;
+      // map -60..0 dBFS → 0..100%
+      const pct = Math.max(0, Math.min(100, ((d.db + 60) / 60) * 100));
+      meterBar.style.width = pct + '%';
+      meterDb.textContent = d.db.toFixed(1);
+    });
+    evtSrc.addEventListener('done', e => {
+      const d = JSON.parse(e.data);
+      if (currentJob && d.job_id !== currentJob) return;
+      statusPill.classList.remove('live');
+      statusPill.textContent = 'done';
+      const r = d.result || {};
+      document.getElementById('result-summary').innerHTML =
+        `Voice key: <span class="pill">${r.key||''}</span>` +
+        ` — kept ${r.seconds_kept?.toFixed?.(1)||'?'}s of speech, ` +
+        ` reference RMS ${r.rms_dbfs?.toFixed?.(1)||'?'} dBFS`;
+      // Fetch full meta so we can show the transcript
+      fetch('/api/voices').then(r => r.json()).then(voices => {
+        const m = voices.find(v => v.key === r.key);
+        const txt = (m && m.ref_text) || '(no transcript)';
+        document.getElementById('result-transcript').textContent = txt;
+      }).catch(() => {
+        document.getElementById('result-transcript').textContent = '(could not fetch transcript)';
+      });
+      document.getElementById('goto-speak').href = `/speak?voice=${encodeURIComponent(r.key)}`;
+      resCard.style.display = '';
+      startBtn.disabled = false;
+      startBtn.textContent = 'Enroll another';
+    });
+    evtSrc.addEventListener('error', e => {
+      try {
+        const d = JSON.parse(e.data || '{}');
+        if (currentJob && d.job_id !== currentJob) return;
+        statusPill.classList.remove('live');
+        statusPill.textContent = 'error';
+        appendLog(`ERROR ${d.error || ''}`);
+        toast(`Enrollment failed: ${d.error || 'unknown'}`, 'bad');
+      } catch {}
+      startBtn.disabled = false;
+    });
+  }
+
+  document.getElementById('reenroll').addEventListener('click', () => {
+    resCard.style.display = 'none';
+    liveCard.style.display = 'none';
+    document.getElementById('name').focus();
+  });
+
+  // ---------- upload-WAV path ----------
+  const dropzone   = document.getElementById('dropzone');
+  const dzText     = document.getElementById('dropzone-text');
+  const fileInput  = document.getElementById('file-input');
+  const dzSelected = document.getElementById('dropzone-selected');
+  const uploadBtn  = document.getElementById('upload');
+  let pickedFile = null;
+
+  function pickFile(f) {
+    if (!f) return;
+    pickedFile = f;
+    dzSelected.innerHTML =
+      `Picked: <strong>${f.name}</strong> · ${(f.size/1024/1024).toFixed(2)} MB`;
+    uploadBtn.disabled = false;
+  }
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => pickFile(fileInput.files[0]));
+
+  dropzone.addEventListener('dragover', e => {
+    e.preventDefault();
+    dropzone.style.borderColor = 'var(--accent)';
+    dropzone.style.background  = 'rgba(255,184,74,0.05)';
+  });
+  dropzone.addEventListener('dragleave', () => {
+    dropzone.style.borderColor = 'var(--border)';
+    dropzone.style.background  = '#0c0f17';
+  });
+  dropzone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropzone.style.borderColor = 'var(--border)';
+    dropzone.style.background  = '#0c0f17';
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) pickFile(e.dataTransfer.files[0]);
+  });
+
+  uploadBtn.addEventListener('click', async () => {
+    const name = document.getElementById('name').value.trim();
+    if (!name)  { toast('Voice name is required', 'bad'); return; }
+    if (!pickedFile) { toast('Pick a file first', 'bad'); return; }
+    uploadBtn.disabled = true; uploadBtn.textContent = 'Uploading…';
+    startBtn.disabled  = true;
+    liveCard.style.display = '';
+    logEl.textContent = '';
+    progBar.style.width = '0%';
+    progPct.textContent = '0%';
+    statusPill.textContent = 'uploading';
+    statusMsg.textContent = pickedFile.name;
+    resCard.style.display = 'none';
+
+    openStream();
+    try {
+      const form = new FormData();
+      form.append('display_name', name);
+      form.append('file', pickedFile);
+      const r = await fetch('/api/enroll/upload', { method: 'POST', body: form });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(e.detail || r.statusText);
+      }
+      const j = await r.json();
+      currentJob = j.job_id;
+      appendLog(`upload job ${currentJob} started (${j.source_file})`);
+    } catch (err) {
+      toast(err.message || String(err), 'bad');
+      uploadBtn.disabled = false;
+      startBtn.disabled  = false;
+    } finally {
+      uploadBtn.textContent = 'Upload & enroll';
+    }
+  });
+
+  startBtn.addEventListener('click', async () => {
+    const name    = nameEl.value.trim();
+    const seconds = parseFloat(secondsEl.value || '30');
+    if (!name) { toast('Voice name is required', 'bad'); return; }
+    startBtn.disabled = true;
+    liveCard.style.display = '';
+    logEl.textContent = '';
+    progBar.style.width = '0%';
+    progPct.textContent = '0%';
+    meterBar.style.width = '0%';
+    meterDb.textContent = '—';
+    statusPill.textContent = 'starting…';
+    statusMsg.textContent = '';
+    resCard.style.display = 'none';
+
+    openStream();
+    try {
+      const r = await fetch('/api/enroll/start', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({display_name: name, seconds}),
+      });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({detail: r.statusText}));
+        throw new Error(e.detail || r.statusText);
+      }
+      const j = await r.json();
+      currentJob = j.job_id;
+      appendLog(`job ${currentJob} started`);
+    } catch (err) {
+      toast(err.message || String(err), 'bad');
+      startBtn.disabled = false;
+    }
+  });
+</script>
+{% endblock %}

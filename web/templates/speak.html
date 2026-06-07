@@ -1,0 +1,157 @@
+{% extends "_base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Speak</h2>
+  {% if not voices %}
+  <p class="muted">No voices enrolled yet. <a href="/enroll">Enroll one first →</a></p>
+  {% else %}
+  <div class="row">
+    <div class="col" style="flex-basis:320px">
+      <label for="voice">Voice</label>
+      <select id="voice">
+        {% for v in voices %}
+        <option value="{{ v.key }}">{{ v.display_name }} ({{ v.key }})</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col" style="flex-basis:160px">
+      <label for="tau">Guidance (cfg)</label>
+      <input id="tau" type="number" min="0.5" max="6.0" step="0.5" value="3.0">
+      <span class="small muted">Higher = closer to you</span>
+    </div>
+    <div class="col" style="flex-basis:200px">
+      <label for="nfe">NFE steps (speed ↔ quality)</label>
+      <select id="nfe">
+        <option value="8"           >  8 — ⚡⚡⚡ RTF 0.41</option>
+        <option value="12"          > 12 — ⚡⚡  RTF 0.58</option>
+        <option value="16" selected > 16 — ⚡   RTF 0.76 ⭐</option>
+        <option value="20"          > 20 — real-time</option>
+        <option value="24"          > 24</option>
+        <option value="32"          > 32 — slow</option>
+        <option value="48"          > 48 — slowest, best</option>
+      </select>
+    </div>
+    <div class="col" style="flex-basis:120px">
+      <label for="speed">Speed</label>
+      <input id="speed" type="number" min="0.5" max="2.0" step="0.05" value="1.0">
+    </div>
+    <div class="col" style="flex-basis:160px">
+      <label for="playback">Play on</label>
+      <select id="playback">
+        <option value="browser" selected>Mac (browser)</option>
+        <option value="jetson">Jetson speaker</option>
+        <option value="both">Both</option>
+      </select>
+    </div>
+  </div>
+
+  <div style="margin-top:14px">
+    <label for="text">Text</label>
+    <textarea id="text" maxlength="1000"
+      placeholder="Hello from the Jetson Orin Nano. This is a voice clone smoke test."></textarea>
+  </div>
+
+  <div style="display:flex;gap:10px;margin-top:12px;align-items:center">
+    <button id="synth" class="btn">Synthesize</button>
+    <button id="warmup" class="btn secondary small" title="preload MeloTTS + Converter so the first synth is fast">
+      warm up models
+    </button>
+    <span id="timing" class="small muted"></span>
+  </div>
+
+  <div id="player-wrap" style="margin-top:18px; display:none">
+    <label>Result</label>
+    <audio id="player" controls style="width:100%"></audio>
+    <p class="small muted" id="player-sub"></p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Pre-select voice from ?voice= query param
+  const params = new URLSearchParams(location.search);
+  const wantedVoice = params.get('voice');
+  if (wantedVoice) {
+    const sel = document.getElementById('voice');
+    if (sel) for (const opt of sel.options) {
+      if (opt.value === wantedVoice) { sel.value = wantedVoice; break; }
+    }
+  }
+
+  const synthBtn = document.getElementById('synth');
+  const warmBtn  = document.getElementById('warmup');
+  const player   = document.getElementById('player');
+  const wrap     = document.getElementById('player-wrap');
+  const sub      = document.getElementById('player-sub');
+  const timing   = document.getElementById('timing');
+
+  async function postJSON(url, body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({detail: r.statusText}));
+      throw new Error(e.detail || r.statusText);
+    }
+    return r.json();
+  }
+
+  // Single-call synth — wait for the full audio to be ready, then play.
+  synthBtn?.addEventListener('click', async () => {
+    const voice_key = document.getElementById('voice').value;
+    const text      = document.getElementById('text').value.trim();
+    const speed     = parseFloat(document.getElementById('speed').value || '1');
+    const tau       = parseFloat(document.getElementById('tau').value || '3.0');
+    const nfe_step  = parseInt(document.getElementById('nfe').value || '16', 10);
+    const playback  = document.getElementById('playback').value;
+    if (!text) { toast('Enter some text first', 'bad'); return; }
+    synthBtn.disabled = true; synthBtn.textContent = 'Synthesizing…';
+    sub.textContent = '';
+    timing.textContent = '';
+    wrap.style.display = '';
+    const t0 = performance.now();
+    try {
+      const r = await postJSON('/api/speak', {voice_key, text, speed, tau, nfe_step});
+      const wall = ((performance.now() - t0) / 1000).toFixed(2);
+      player.src = r.wav_url + '?t=' + Date.now();
+      sub.textContent =
+        `${r.seconds.toFixed(2)}s audio · server ${r.elapsed.toFixed(2)}s · rtf ${r.rtf.toFixed(2)} · client ${wall}s`;
+      timing.textContent = `rtf ${r.rtf.toFixed(2)} (${r.elapsed.toFixed(2)}s on Orin)`;
+
+      // Playback destination
+      const wavName = r.wav_url.split('/').pop();
+      if (playback === 'browser' || playback === 'both') {
+        player.play().catch(() => {});
+      }
+      if (playback === 'jetson' || playback === 'both') {
+        try {
+          await postJSON('/api/play/local', {wav_name: wavName});
+        } catch (err) {
+          toast(`Jetson playback failed: ${err.message || err}`, 'bad');
+        }
+      }
+    } catch (e) {
+      toast(e.message || String(e), 'bad');
+    } finally {
+      synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
+    }
+  });
+
+  warmBtn?.addEventListener('click', async () => {
+    warmBtn.disabled = true; warmBtn.textContent = 'warming…';
+    try {
+      await postJSON('/api/warmup', {});
+      toast('Warmup started — first synth will be fast in ~15 s');
+    } catch (e) {
+      toast(e.message || String(e), 'bad');
+    } finally {
+      // a real "ready" comes via SSE; for now just re-enable after a beat
+      setTimeout(() => { warmBtn.disabled = false; warmBtn.textContent = 'warm up models'; }, 1000);
+    }
+  });
+</script>
+{% endblock %}
