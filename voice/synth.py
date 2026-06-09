@@ -322,28 +322,30 @@ _SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 def split_sentences(
     text: str,
-    target_chars: int = 220,
-    max_chars: int = 320,
-    first_chunk_max: int = 30,
+    target_chars: int = 140,
+    max_chars: int = 260,
+    first_chunk_min: int = 24,
+    first_chunk_max: int = 55,
 ) -> list[str]:
     """
-    Split text into chunks that are roughly `target_chars` long and never
-    longer than `max_chars`. Four goals:
+    Split text into chunks for smooth streaming playback.
 
-    1. **Tiny FIRST chunk for fast time-to-first-audio.** The first
-       chunk is capped at `first_chunk_max` (~60 chars = roughly 1.5 s
-       of audio) so playback can start ~1.5-2 s after the user hits
-       Speak.  Subsequent chunks are full-sized.
-    2. **Avoid tiny later chunks.** "Hello." rendered alone is a 0.5 s
-       audio clip the server takes ~0.8 s to produce — playback ends
-       before the next chunk is ready and the listener hears a gap.
-       Greedy merging keeps each later chunk long enough to mask the
-       next chunk's render time.
-    3. **Avoid giant chunks.** A 30-second chunk blocks playback start
-       and feels like the streaming isn't streaming.
-    4. **Keep cuts on natural pause points.** Always try sentence-level
-       (.!?), then comma/semicolon, then word boundary as a last
-       resort if a single sentence is longer than first_chunk_max.
+    The constraint that drives everything: on the Jetson, a chunk takes
+    ~0.9× its own audio-duration to render (nfe=16).  So for playback to
+    be gap-free, each chunk's render time must be hidden behind the
+    PREVIOUS chunk's playback.  That means two things:
+
+    1. **First chunk: small but not tiny.**  We want the first audio in
+       ~2 s, so the first chunk targets `first_chunk_min..first_chunk_max`
+       chars (~1.2-1.8 s of audio, renders ~1.8-2.2 s at nfe=12).  It
+       must NOT be a bare "Hello." (0.3 s audio) — that finishes playing
+       seconds before chunk 2 is ready and the listener hears a gap.  A
+       too-short leading sentence is merged forward into the next.
+    2. **Later chunks: ~target_chars.**  Big enough that their own
+       playback (~1.5 s) masks the next chunk's render, small enough
+       that no single chunk blocks the stream.
+    3. **Cuts on natural pauses.**  Sentence (.!?) first, then
+       comma/semicolon, then word boundary.
     """
     text = (text or "").strip()
     if not text:
@@ -370,8 +372,8 @@ def split_sentences(
         if buf:
             pieces.append(buf)
 
-    # 3. greedily merge — but cap chunk[0] at first_chunk_max so the
-    #    first audio fires fast.
+    # 3. greedy merge with a per-position cap.  chunk[0] caps at
+    #    first_chunk_max; the rest at target_chars.
     out: list[str] = []
     buf = ""
     for p in pieces:
@@ -386,35 +388,52 @@ def split_sentences(
     if buf:
         out.append(buf)
 
-    # 4. if the first chunk is STILL longer than first_chunk_max (one
-    #    sentence with no comma is bigger than the cap), split it at
-    #    the nearest natural break under the cap, falling through:
-    #    comma/semicolon → em-dash → word boundary.  We require at
-    #    least 5 chars before the cut so we never produce a "Hi"-only
-    #    first chunk.  But if the input is a single short sentence
-    #    that the user could reasonably hear as one phrase
-    #    (~ first_chunk_max + 25 chars total), keep it intact — the
-    #    tail-chunk would be too tiny to render efficiently AND
-    #    leave a long gap before chunk[1] arrives.
-    INTACT_MAX = first_chunk_max + 25
+    # 4. if chunk[0] is too SHORT (e.g. a bare "Hello."), pull words
+    #    from chunk[1] forward until it reaches first_chunk_min, cutting
+    #    chunk[1] on a word boundary.  A 0.3 s first chunk followed by a
+    #    4 s render gap is the worst failure mode; a slightly bigger
+    #    first chunk that starts ~0.3 s later is far better UX.
+    if len(out) >= 2 and len(out[0]) < first_chunk_min:
+        head, nxt = out[0], out[1]
+        want = first_chunk_min - len(head)
+        # take whole words from nxt until head is long enough
+        words = nxt.split()
+        take = []
+        taken_len = 0
+        for w in words:
+            take.append(w)
+            taken_len += len(w) + 1
+            if len(head) + 1 + taken_len >= first_chunk_min:
+                break
+        moved = " ".join(take)
+        remainder = nxt[len(moved):].strip()
+        new_head = (head + " " + moved).strip()
+        if remainder:
+            out = [new_head, remainder] + out[2:]
+        else:
+            out = [new_head] + out[2:]
+
+    # 5. if chunk[0] is too LONG (one long sentence with no early
+    #    break), split it under first_chunk_max at the nearest natural
+    #    break: comma/semicolon → em-dash → word boundary.  Keep a
+    #    single short sentence intact if it's only modestly over.
+    INTACT_MAX = first_chunk_max + 20
     if (out and len(out[0]) > first_chunk_max
             and not (len(out) == 1 and len(out[0]) <= INTACT_MAX)):
         first = out[0]
         cut_at = -1
         for sep in (", ", "; ", " — ", " - "):
             idx = first.rfind(sep, 0, first_chunk_max)
-            if idx >= 5:
+            if idx >= first_chunk_min:
                 cut_at = idx + len(sep)
                 break
         if cut_at < 0:
             idx = first.rfind(" ", 0, first_chunk_max)
-            if idx >= 5:
+            if idx >= first_chunk_min:
                 cut_at = idx + 1
         if cut_at > 0:
             head = first[:cut_at].strip()
             tail = first[cut_at:].strip()
-            # Refuse to create a tail tinier than 12 chars — playback
-            # gap is worse than a slightly slower TTfA.
             if head and tail and len(tail) >= 12:
                 out = [head, tail] + out[1:]
     return out

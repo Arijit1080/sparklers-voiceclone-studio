@@ -111,7 +111,12 @@ class EnrollmentResult:
     seconds_kept: float
 
 
-REF_TARGET_SEC = 8.0    # F5-TTS works best in the 5-10s range
+REF_TARGET_SEC = 5.5    # F5-TTS reprocesses the WHOLE reference at every
+                        # denoising step, so synth time scales with
+                        # reference length.  5.5s clones as well as 8s
+                        # but keeps time-to-first-audio under 2s on the
+                        # Jetson Orin Nano.  (Was 8.0 — measured 2.84s
+                        # first-chunk at 8s vs 1.85s at 5s.)
 
 
 def enroll_from_wav(
@@ -196,6 +201,52 @@ def enroll_from_wav(
         embedding_path=emb_path,
         seconds_kept=meta.seconds,
     )
+
+
+# ---------- reduce existing references (one-time migration) ----------
+
+def reduce_reference(key: str, target_sec: float = REF_TARGET_SEC,
+                     ) -> Optional[float]:
+    """Shrink an already-enrolled reference to `target_sec` and
+    re-transcribe so the saved ref_text matches the shortened audio.
+
+    F5-TTS conditions on the full reference at every step, so an 8s
+    reference is ~50% slower to synthesize than a 5.5s one for no
+    quality gain.  This re-crops the on-disk WAV (centered window) and
+    re-runs Whisper so ref_audio and ref_text stay aligned — a longer
+    transcript than audio makes F5 rush the output, so we MUST
+    re-transcribe rather than just truncate.
+
+    Returns the new duration in seconds, or None if the voice was
+    already at/under target (no change made).
+    """
+    from .registry import load_meta, save_meta
+
+    wav = enroll_wav_path(key)
+    if not wav.exists():
+        log.warning("reduce_reference: no WAV for voice=%s", key)
+        return None
+
+    samples, sr = load_wav(wav)
+    cur_sec = len(samples) / sr
+    if cur_sec <= target_sec + 0.1:
+        return None    # already short enough
+
+    target_n = int(target_sec * sr)
+    start = (len(samples) - target_n) // 2
+    cropped = samples[start : start + target_n]
+    save_wav(wav, cropped, sr)
+
+    new_text = _transcribe(wav)
+    meta = load_meta(key)
+    if meta is not None:
+        meta.seconds = round(len(cropped) / sr, 2)
+        if new_text:
+            meta.ref_text = new_text
+        save_meta(meta)
+    log.info("[%s] reference reduced %.1fs -> %.1fs, re-transcribed=%r",
+             key, cur_sec, len(cropped) / sr, (new_text or "")[:60])
+    return len(cropped) / sr
 
 
 # ---------- live-mic enrollment ----------
