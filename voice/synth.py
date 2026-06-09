@@ -269,17 +269,30 @@ def _hard_trim_silence_inplace(
     wav_path: Path,
     head_db: float = -42.0,
     tail_db: float = -42.0,
+    sil_db: float = -45.0,
     fade_ms: int = 15,
     min_trim_ms: int = 30,
+    keep_pause_ms: int = 280,
+    max_internal_sil_ms: int = 320,
 ) -> int:
-    """Trim leading/trailing silence from the in-memory waveform F5-TTS
-    just returned, then overwrite the on-disk WAV ONLY if the crop is
-    larger than `min_trim_ms` total. Returns the (possibly cropped) length.
+    """Clean the waveform F5-TTS just returned:
+
+      1. Trim leading/trailing silence (head/tail).
+      2. Compress any INTERNAL silence longer than `max_internal_sil_ms`
+         down to `keep_pause_ms`.  F5-TTS intermittently emits 0.5-1.5 s
+         dead-air gaps mid-utterance (a known flow-matching duration-
+         prediction artifact); left in, they sound like the audio froze.
+         We keep natural sentence pauses (<= max_internal_sil_ms) intact
+         and only collapse the glitchy long ones.
+
+    Rewrites the on-disk WAV only if something actually changed.  Returns
+    the resulting length in samples.
     """
     import numpy as _np
     a = audio if hasattr(audio, "shape") else _np.asarray(audio, dtype=_np.float32)
     if a.ndim > 1:
         a = a[:, 0]
+    a = a.astype(_np.float32, copy=True)
     if a.size == 0:
         return 0
 
@@ -290,27 +303,63 @@ def _hard_trim_silence_inplace(
 
     rms = _np.sqrt(_np.mean(a[:n_full].reshape(-1, win).astype(_np.float64) ** 2, axis=1) + 1e-12)
     rms_db = 20.0 * _np.log10(rms + 1e-12)
+
+    # ---- 1. head/tail trim ----
     voiced = _np.where(rms_db > head_db)[0]
     if voiced.size == 0:
         return a.size
-
     start = int(voiced[0]) * win
     voiced_tail = _np.where(rms_db > tail_db)[0]
     end = min((int(voiced_tail[-1]) + 1) * win, a.size)
+    core = a[start:end]
 
-    cut_total_ms = (start + (a.size - end)) * 1000 / sr
-    if cut_total_ms < min_trim_ms:
-        return a.size                       # not worth a rewrite
+    # ---- 2. compress internal silences ----
+    # Re-frame the trimmed core and find silence runs.
+    cn_full = (core.size // win) * win
+    keep_pause = int(sr * keep_pause_ms / 1000.0)
+    max_sil = int(sr * max_internal_sil_ms / 1000.0)
+    rebuilt = core
+    if cn_full >= win:
+        crms = _np.sqrt(_np.mean(core[:cn_full].reshape(-1, win).astype(_np.float64) ** 2, axis=1) + 1e-12)
+        cdb = 20.0 * _np.log10(crms + 1e-12)
+        is_sil = cdb < sil_db
+        # build list of (start_sample, end_sample, is_silence) segments
+        segs = []
+        k = 0
+        while k < len(is_sil):
+            j = k
+            while j < len(is_sil) and is_sil[j] == is_sil[k]:
+                j += 1
+            segs.append((k * win, j * win, bool(is_sil[k])))
+            k = j
+        # any internal silence longer than max_sil → shrink to keep_pause
+        if any(sil and (e - s) > max_sil for s, e, sil in segs):
+            parts = []
+            for idx, (s, e, sil) in enumerate(segs):
+                seg = core[s:e]
+                if sil and (e - s) > max_sil:
+                    # leading/trailing silence inside core shouldn't
+                    # happen after head/tail trim, but guard anyway
+                    seg = seg[:keep_pause]
+                parts.append(seg)
+            rebuilt = _np.concatenate(parts) if parts else core
 
-    cropped = a[start:end].copy()
+    if rebuilt is core:
+        cut_total_ms = (start + (a.size - end)) * 1000 / sr
+        if cut_total_ms < min_trim_ms:
+            return a.size                       # nothing worth rewriting
+        out = core.copy()
+    else:
+        out = rebuilt.copy()
+
     fade = max(1, int(sr * fade_ms / 1000.0))
-    if cropped.size > 2 * fade:
+    if out.size > 2 * fade:
         ramp = _np.linspace(0.0, 1.0, fade, dtype=_np.float32)
-        cropped[:fade] *= ramp
-        cropped[-fade:] *= ramp[::-1]
+        out[:fade] *= ramp
+        out[-fade:] *= ramp[::-1]
 
-    sf.write(str(wav_path), cropped, sr)
-    return cropped.size
+    sf.write(str(wav_path), out, sr)
+    return out.size
 
 
 # ---------- sentence-level streaming ----------
