@@ -67,11 +67,26 @@ def record_clip(
     """
     Block-record `seconds` of mono audio.
 
+    Some USB codecs only accept the channel count they natively support
+    (e.g. the Waveshare codec exposes 2 channels and rejects 1-ch open).
+    To stay portable we open the device at its native channel count and
+    down-mix to mono in software.
+
     on_progress(t_seconds, rms_dbfs) is called ~10x/sec while the
     capture is running so the UI can draw a live VU meter.
     """
     if device is None:
         device = DEFAULT_DEV
+
+    # discover the device's native input channel count and pick the
+    # smallest valid open we can do (1 if the device allows, else its
+    # native max — typically 2 for USB codecs).
+    try:
+        info = sd.query_devices(device)
+        native_in = int(info.get("max_input_channels", 1))
+    except Exception:
+        native_in = 1
+    open_ch = 1 if native_in <= 1 else min(2, native_in)
 
     n_total = int(round(seconds * samplerate))
     buf = np.zeros((n_total,), dtype=np.int16)
@@ -80,7 +95,7 @@ def record_clip(
 
     stream = sd.InputStream(
         samplerate=samplerate,
-        channels=CHANNELS,
+        channels=open_ch,
         dtype=DTYPE,
         device=device,
         blocksize=chunk_n,
@@ -90,7 +105,11 @@ def record_clip(
     try:
         while cursor < n_total:
             block, _ = stream.read(min(chunk_n, n_total - cursor))
-            block = block.reshape(-1)
+            # block shape: (frames, open_ch); mix to mono by mean across channels
+            if open_ch > 1:
+                block = block.astype(np.int32).mean(axis=1).astype(np.int16)
+            else:
+                block = block.reshape(-1)
             buf[cursor:cursor + len(block)] = block
             cursor += len(block)
             if on_progress is not None:

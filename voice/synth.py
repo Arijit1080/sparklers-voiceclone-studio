@@ -320,21 +320,30 @@ import re
 _SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 
-def split_sentences(text: str, target_chars: int = 220, max_chars: int = 320) -> list[str]:
+def split_sentences(
+    text: str,
+    target_chars: int = 220,
+    max_chars: int = 320,
+    first_chunk_max: int = 30,
+) -> list[str]:
     """
     Split text into chunks that are roughly `target_chars` long and never
-    longer than `max_chars`. Three goals:
+    longer than `max_chars`. Four goals:
 
-    1. **Avoid tiny chunks.** "Hello." rendered alone is a 0.5 s audio
-       clip the server takes ~0.8 s to produce — playback ends before
-       the next chunk is ready and the listener hears a gap. Greedy
-       merging keeps each chunk's audio long enough to mask the next
-       chunk's render time.
-    2. **Avoid giant chunks.** A 30-second chunk blocks playback start
+    1. **Tiny FIRST chunk for fast time-to-first-audio.** The first
+       chunk is capped at `first_chunk_max` (~60 chars = roughly 1.5 s
+       of audio) so playback can start ~1.5-2 s after the user hits
+       Speak.  Subsequent chunks are full-sized.
+    2. **Avoid tiny later chunks.** "Hello." rendered alone is a 0.5 s
+       audio clip the server takes ~0.8 s to produce — playback ends
+       before the next chunk is ready and the listener hears a gap.
+       Greedy merging keeps each later chunk long enough to mask the
+       next chunk's render time.
+    3. **Avoid giant chunks.** A 30-second chunk blocks playback start
        and feels like the streaming isn't streaming.
-    3. **Keep cuts on natural pause points.** Always try sentence-level
-       (.!?), only fall back to comma/semicolon if a single sentence
-       blows past max_chars.
+    4. **Keep cuts on natural pause points.** Always try sentence-level
+       (.!?), then comma/semicolon, then word boundary as a last
+       resort if a single sentence is longer than first_chunk_max.
     """
     text = (text or "").strip()
     if not text:
@@ -361,20 +370,60 @@ def split_sentences(text: str, target_chars: int = 220, max_chars: int = 320) ->
         if buf:
             pieces.append(buf)
 
-    # 3. greedily merge adjacent pieces until we hit target_chars
+    # 3. greedily merge — but cap chunk[0] at first_chunk_max so the
+    #    first audio fires fast.
     out: list[str] = []
     buf = ""
     for p in pieces:
+        cap = first_chunk_max if not out else target_chars
         if not buf:
             buf = p
-        elif len(buf) + 1 + len(p) <= target_chars:
+        elif len(buf) + 1 + len(p) <= cap:
             buf = buf + " " + p
         else:
             out.append(buf)
             buf = p
     if buf:
         out.append(buf)
+
+    # 4. if the first chunk is STILL longer than first_chunk_max (one
+    #    sentence with no comma is bigger than the cap), split it at
+    #    the nearest natural break under the cap, falling through:
+    #    comma/semicolon → em-dash → word boundary.  We require at
+    #    least 5 chars before the cut so we never produce a "Hi"-only
+    #    first chunk.  But if the input is a single short sentence
+    #    that the user could reasonably hear as one phrase
+    #    (~ first_chunk_max + 25 chars total), keep it intact — the
+    #    tail-chunk would be too tiny to render efficiently AND
+    #    leave a long gap before chunk[1] arrives.
+    INTACT_MAX = first_chunk_max + 25
+    if (out and len(out[0]) > first_chunk_max
+            and not (len(out) == 1 and len(out[0]) <= INTACT_MAX)):
+        first = out[0]
+        cut_at = -1
+        for sep in (", ", "; ", " — ", " - "):
+            idx = first.rfind(sep, 0, first_chunk_max)
+            if idx >= 5:
+                cut_at = idx + len(sep)
+                break
+        if cut_at < 0:
+            idx = first.rfind(" ", 0, first_chunk_max)
+            if idx >= 5:
+                cut_at = idx + 1
+        if cut_at > 0:
+            head = first[:cut_at].strip()
+            tail = first[cut_at:].strip()
+            # Refuse to create a tail tinier than 12 chars — playback
+            # gap is worse than a slightly slower TTfA.
+            if head and tail and len(tail) >= 12:
+                out = [head, tail] + out[1:]
     return out
+
+
+FIRST_CHUNK_NFE = 12   # lower nfe for the very first chunk only —
+                       # 1.7-2.0 s render time at ~5-8 words instead of
+                       # ~2.5-3 s at the default nfe=16, with quality
+                       # drop limited to the first ~1.5 s of audio
 
 
 def speak_stream(
@@ -385,6 +434,7 @@ def speak_stream(
     base_speaker: str = "F5-Base",
     tau: float = DEFAULT_CFG,
     nfe_step: int = DEFAULT_NFE,
+    first_chunk_nfe: int = FIRST_CHUNK_NFE,
 ):
     """
     Generator that yields one SynthResult per sentence-sized chunk.
@@ -392,23 +442,30 @@ def speak_stream(
     The web layer streams these out as SSE events so the browser can
     start playback the moment the first chunk lands while the rest
     render in the background.
+
+    First chunk is rendered at `first_chunk_nfe` (default 12) so
+    time-to-first-audio stays around 1.7-2.0 s on a Jetson Orin Nano.
+    Remaining chunks use `nfe_step` (default 16) for full quality.
     """
     text = (text or "").strip()
     if not text:
         raise ValueError("text is empty")
 
     chunks = split_sentences(text)
-    log.info("streaming %d chunks for voice=%s", len(chunks), voice_key)
+    log.info("streaming %d chunks for voice=%s (first_nfe=%d, rest_nfe=%d)",
+             len(chunks), voice_key, first_chunk_nfe, nfe_step)
 
     for i, chunk in enumerate(chunks):
+        nfe_for_chunk = first_chunk_nfe if i == 0 else nfe_step
         result = speak(
             voice_key, chunk,
             speed=speed, base_speaker=base_speaker,
-            tau=tau, nfe_step=nfe_step,
+            tau=tau, nfe_step=nfe_for_chunk,
             output=OUT_AUDIO / f"{voice_key}-{int(time.time()*1000)}-{i:02d}.wav",
         )
-        log.info("  chunk %d/%d: %r (%.2fs audio, rtf %.2f)",
-                 i + 1, len(chunks), chunk[:48], result.seconds, result.rtf)
+        log.info("  chunk %d/%d nfe=%d: %r (%.2fs audio, rtf %.2f)",
+                 i + 1, len(chunks), nfe_for_chunk, chunk[:48],
+                 result.seconds, result.rtf)
         yield result
 
 
