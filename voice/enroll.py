@@ -111,12 +111,57 @@ class EnrollmentResult:
     seconds_kept: float
 
 
-REF_TARGET_SEC = 5.5    # F5-TTS reprocesses the WHOLE reference at every
+REF_TARGET_SEC = 3.0    # F5-TTS reprocesses the WHOLE reference at every
                         # denoising step, so synth time scales with
-                        # reference length.  5.5s clones as well as 8s
-                        # but keeps time-to-first-audio under 2s on the
-                        # Jetson Orin Nano.  (Was 8.0 — measured 2.84s
-                        # first-chunk at 8s vs 1.85s at 5s.)
+                        # reference length.  3s keeps time-to-first-audio
+                        # under 2s on the Jetson Orin Nano.  Selectable in
+                        # the UI (3 / 5.5 / 8 s) — longer = better speaker
+                        # fidelity but slower start.
+
+# Allowed reference lengths exposed in the UI.
+REF_LENGTH_CHOICES = (3.0, 5.5, 8.0)
+
+
+def _clean_onset_crop(samples: np.ndarray, sr: int, target_sec: float,
+                      pre_pause_ms: int = 80) -> Optional[np.ndarray]:
+    """Find a `target_sec` window that STARTS right after a natural pause.
+
+    A centered crop usually begins mid-word at full energy; F5-TTS then
+    reproduces that abrupt onset as an "eii"/"ahh" artifact at the start
+    of EVERY generation.  Cropping so the reference begins silence→speech
+    fixes it at the source.  Returns the int16 window, or None if no clean
+    onset exists (caller falls back to a centered crop + leading silence).
+    """
+    a = samples.astype(np.float32)
+    win = int(sr * 0.020)
+    nf = (a.size // win) * win
+    if nf < win:
+        return None
+    db = 20.0 * np.log10(
+        np.sqrt(np.mean((a[:nf] / 32768.0).reshape(-1, win) ** 2, axis=1) + 1e-12) + 1e-12)
+    sil = db < -45.0
+    need_v = int(target_sec / 0.020)
+    pre = max(1, int(pre_pause_ms / 20))
+    best = None
+    i = pre
+    while i < len(sil) - need_v:
+        if bool(np.all(sil[i - pre:i])):          # a pause just before i
+            voiced_ratio = float((~sil[i:i + need_v]).mean())
+            if voiced_ratio > 0.72 and (best is None or voiced_ratio > best[1]):
+                best = (i, voiced_ratio)
+            i += need_v
+            continue
+        i += 1
+    if best is None:
+        return None
+    # start a few frames into the pause so the window opens on a little
+    # leading silence, then the speech
+    start = max(0, (best[0] - 3)) * win
+    target_n = int(target_sec * sr)
+    crop = a[start:start + target_n]
+    if crop.size < target_n:
+        return None
+    return crop.astype(np.int16)
 
 
 def enroll_from_wav(
@@ -124,10 +169,11 @@ def enroll_from_wav(
     display_name: str,
     raw_wav_path: Path,
     *,
+    ref_seconds: float = REF_TARGET_SEC,
     on_progress: Optional[Callable[[str, float], None]] = None,
 ) -> EnrollmentResult:
     """
-    Trim → crop to ~8 s window → transcribe → persist meta + WAV.
+    Clean-onset crop to `ref_seconds` → transcribe → persist meta + WAV.
 
     `on_progress(message, ratio_0_1)` is called at a few checkpoints.
     """
@@ -151,18 +197,25 @@ def enroll_from_wav(
             "Speak continuously for the full window."
         )
 
-    # F5-TTS likes 5-10 s of clean voiced audio. Crop to a centered
-    # REF_TARGET_SEC window if the trimmed reference is longer.
-    target_n = int(REF_TARGET_SEC * SAMPLE_RATE)
-    cropped = vad.samples
-    if cropped.size > target_n:
-        start = (cropped.size - target_n) // 2
-        cropped = cropped[start : start + target_n]
+    target_n = int(ref_seconds * SAMPLE_RATE)
+    # Prefer a CLEAN-ONSET crop from the raw (pre-VAD) audio so the
+    # reference starts silence→speech and F5 never emits the leading
+    # "eii"/"ahh" artifact.
+    cropped = _clean_onset_crop(samples, sr, ref_seconds)
+    if cropped is not None:
         if on_progress:
-            on_progress(
-                f"keeping centered {REF_TARGET_SEC:.0f}s of {vad.samples.size / SAMPLE_RATE:.1f}s",
-                0.30,
-            )
+            on_progress(f"clean-onset {ref_seconds:.1f}s reference", 0.30)
+    else:
+        # fallback: centered crop of the VAD'd audio with a short leading
+        # silence prepended so the onset is still clean
+        c = vad.samples
+        if c.size > target_n:
+            start = (c.size - target_n) // 2
+            c = c[start:start + target_n]
+        lead = np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.int16)
+        cropped = np.concatenate([lead, c])[:target_n] if c.size else c
+        if on_progress:
+            on_progress(f"centered {ref_seconds:.1f}s reference (no pause found)", 0.30)
 
     cleaned_wav = enroll_wav_path(key)
     save_wav(cleaned_wav, cropped, SAMPLE_RATE)
@@ -205,36 +258,42 @@ def enroll_from_wav(
 
 # ---------- reduce existing references (one-time migration) ----------
 
-def reduce_reference(key: str, target_sec: float = REF_TARGET_SEC,
-                     ) -> Optional[float]:
-    """Shrink an already-enrolled reference to `target_sec` and
-    re-transcribe so the saved ref_text matches the shortened audio.
-
-    F5-TTS conditions on the full reference at every step, so an 8s
-    reference is ~50% slower to synthesize than a 5.5s one for no
-    quality gain.  This re-crops the on-disk WAV (centered window) and
-    re-runs Whisper so ref_audio and ref_text stay aligned — a longer
-    transcript than audio makes F5 rush the output, so we MUST
-    re-transcribe rather than just truncate.
-
-    Returns the new duration in seconds, or None if the voice was
-    already at/under target (no change made).
+def set_reference_length(key: str, target_sec: float) -> Optional[float]:
+    """Re-crop an enrolled voice's reference to `target_sec` with a CLEAN
+    onset, preferring the original raw recording (which still has the
+    pauses needed to find a silence→speech start).  Re-transcribes so the
+    saved ref_text matches the new audio.  Returns the new duration, or
+    None on failure.
     """
     from .registry import load_meta, save_meta
 
     wav = enroll_wav_path(key)
-    if not wav.exists():
-        log.warning("reduce_reference: no WAV for voice=%s", key)
+    raw = wav.with_suffix(".raw.wav")
+    src = raw if raw.exists() else wav
+    if not src.exists():
+        log.warning("set_reference_length: no source WAV for voice=%s", key)
         return None
 
-    samples, sr = load_wav(wav)
-    cur_sec = len(samples) / sr
-    if cur_sec <= target_sec + 0.1:
-        return None    # already short enough
+    samples, sr = load_wav(src)
+    if sr != SAMPLE_RATE:
+        ratio = SAMPLE_RATE / sr
+        n_new = int(round(len(samples) * ratio))
+        samples = np.interp(
+            np.linspace(0, len(samples) - 1, n_new),
+            np.arange(len(samples)), samples.astype(np.float32),
+        ).astype(np.int16)
+        sr = SAMPLE_RATE
 
     target_n = int(target_sec * sr)
-    start = (len(samples) - target_n) // 2
-    cropped = samples[start : start + target_n]
+    cropped = _clean_onset_crop(samples, sr, target_sec)
+    if cropped is None:
+        # fallback: centered crop + leading silence
+        c = samples
+        if c.size > target_n:
+            st = (c.size - target_n) // 2
+            c = c[st:st + target_n]
+        lead = np.zeros(int(sr * 0.12), dtype=np.int16)
+        cropped = np.concatenate([lead, c])[:target_n] if c.size else c
     save_wav(wav, cropped, sr)
 
     new_text = _transcribe(wav)
@@ -244,9 +303,15 @@ def reduce_reference(key: str, target_sec: float = REF_TARGET_SEC,
         if new_text:
             meta.ref_text = new_text
         save_meta(meta)
-    log.info("[%s] reference reduced %.1fs -> %.1fs, re-transcribed=%r",
-             key, cur_sec, len(cropped) / sr, (new_text or "")[:60])
+    log.info("[%s] reference set to %.1fs (clean onset), re-transcribed=%r",
+             key, len(cropped) / sr, (new_text or "")[:60])
     return len(cropped) / sr
+
+
+# backwards-compat alias
+def reduce_reference(key: str, target_sec: float = REF_TARGET_SEC,
+                     ) -> Optional[float]:
+    return set_reference_length(key, target_sec)
 
 
 # ---------- live-mic enrollment ----------
@@ -256,6 +321,7 @@ def enroll_from_mic(
     display_name: str,
     *,
     seconds: float = 15.0,         # default down from 30 — F5 wants shorter clean refs
+    ref_seconds: float = REF_TARGET_SEC,
     device: Optional[int] = None,
     play_cues: bool = True,
     on_progress: Optional[Callable[[str, float], None]] = None,
@@ -284,4 +350,5 @@ def enroll_from_mic(
             0.10,
         )
 
-    return enroll_from_wav(key, display_name, raw_path, on_progress=on_progress)
+    return enroll_from_wav(key, display_name, raw_path,
+                           ref_seconds=ref_seconds, on_progress=on_progress)

@@ -42,6 +42,13 @@
         <option value="both">Both</option>
       </select>
     </div>
+    <div class="col" style="flex-basis:200px">
+      <label for="chunkmode">Chunking</label>
+      <select id="chunkmode">
+        <option value="smart" selected>Smooth (gapless, ~2.6s start)</option>
+        <option value="sentence">Per sentence (natural, may gap)</option>
+      </select>
+    </div>
   </div>
 
   <div style="margin-top:14px">
@@ -109,6 +116,7 @@
     const tau       = parseFloat(document.getElementById('tau').value || '3.0');
     const nfe_step  = parseInt(document.getElementById('nfe').value || '16', 10);
     const playback  = document.getElementById('playback').value;
+    const chunkMode = document.getElementById('chunkmode').value;
     if (!text) { toast('Enter some text first', 'bad'); return; }
     synthBtn.disabled = true; synthBtn.textContent = 'Synthesizing…';
     sub.textContent = '';
@@ -119,32 +127,69 @@
     let firstChunkAt = null;
     let totalChunks = 0;
     let receivedChunks = 0;
-
-    const queue = [];       // wav URLs waiting to play in order
-    let playingIdx = -1;    // -1 = nothing playing
     let streamDone = false;
-    let serverErr = null;
 
-    function playNext() {
-      if (playingIdx >= 0 || queue.length === 0) return;
-      const item = queue.shift();
-      playingIdx = item.index;
-      player.src = item.wav_url + '?t=' + Date.now();
-      player.play().catch(() => {});
-    }
-    player.onended = () => {
-      playingIdx = -1;
-      if (queue.length > 0) {
-        playNext();
-      } else if (streamDone) {
-        // all chunks played, all chunks delivered, we're done
-        synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
+    // ---- Web Audio gapless player ----
+    // Chaining <audio> elements (src=...; onended->next) has an
+    // inherent gap: the browser fetches+decodes the next clip only
+    // after the previous ends.  Instead we decode each chunk to an
+    // AudioBuffer and BUTT-JOIN them on the AudioContext clock: chunk
+    // N+1 starts exactly when chunk N ends, no overlap.  (A crossfade
+    // would superimpose two DIFFERENT chunks during the overlap, which
+    // sounds like a collapse/blur — wrong for non-overlapping speech.)
+    // The server already fades each chunk's edges to zero, so the
+    // butt-join is click-free and seamless.
+    const useBrowser = (playback === 'browser' || playback === 'both');
+    let audioCtx = null;
+    let playHead = 0;            // ctx time where the next chunk starts
+    let scheduleChain = Promise.resolve();   // serialize in index order
+    let scheduledEnd = 0;        // ctx time the last chunk finishes
+    let started = false;
+    const collected = [];        // {index, wav_url} for download/replay
+
+    function ensureCtx() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       }
-    };
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      return audioCtx;
+    }
 
-    // Build the SSE URL — endpoint is GET so query params
+    function scheduleChunk(wavUrl) {
+      scheduleChain = scheduleChain.then(async () => {
+        const ctx = ensureCtx();
+        const arr = await (await fetch(wavUrl)).arrayBuffer();
+        const buf = await ctx.decodeAudioData(arr);
+        const now = ctx.currentTime;
+        let start;
+        if (!started) {
+          start = now + 0.06;           // first chunk: tiny lead-in
+          started = true;
+        } else {
+          // butt-join: continue exactly where the last chunk ends.  If
+          // decode ran late and we're already past that point, start now
+          // (a small gap is the worst case — never an overlap).
+          start = Math.max(playHead, now + 0.01);
+        }
+        const dur = buf.duration;
+
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);   // flat gain — no crossfade
+        src.start(start);
+
+        playHead = start + dur;
+        scheduledEnd = start + dur;
+      }).catch((e) => console.error('schedule failed', e));
+    }
+
+    // Build the SSE URL — endpoint is GET so query params.  `playback`
+    // is passed so the SERVER does Jetson-speaker playback sequentially
+    // (one persistent aplay), instead of the client firing one aplay per
+    // chunk (which overlapped).
     const qs = new URLSearchParams({
-      voice_key, text, speed, tau, nfe_step,
+      voice_key, text, speed, tau, nfe_step, chunk_mode: chunkMode,
+      playback,
     });
     const es = new EventSource(`/api/speak/stream?${qs.toString()}`);
 
@@ -164,33 +209,40 @@
           firstChunkAt = (performance.now() - t0) / 1000;
           timing.textContent = `first audio in ${firstChunkAt.toFixed(2)}s`;
         }
-        queue.push({index: data.index, wav_url: data.wav_url});
+        collected.push({index: data.index, wav_url: data.wav_url});
         sub.textContent =
           `chunk ${receivedChunks}/${totalChunks} ready (server ${data.elapsed.toFixed(2)}s, audio ${data.seconds.toFixed(2)}s, rtf ${data.rtf.toFixed(2)})`;
 
-        // Jetson-side playback (fire and forget per chunk)
-        if (playback === 'jetson' || playback === 'both') {
-          const wavName = data.wav_url.split('/').pop();
-          postJSON('/api/play/local', {wav_name: wavName}).catch(() => {});
-        }
-        // Browser playback starts as soon as we have something queued
-        if (playback === 'browser' || playback === 'both') {
-          playNext();
-        }
+        // Jetson-speaker playback is handled SERVER-SIDE now (sequential
+        // single-aplay), so the client no longer fires per-chunk aplay.
+        // Browser: decode + schedule this chunk gaplessly via Web Audio.
+        if (useBrowser) scheduleChunk(data.wav_url);
       } catch (_) {}
     });
+
+    function finish() {
+      // also expose the full audio in the <audio> element for replay/
+      // download once everything is in (first chunk for now; the
+      // gapless playback above is what the user actually hears live).
+      if (collected.length) {
+        player.src = collected[0].wav_url + '?t=' + Date.now();
+      }
+      synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
+    }
 
     es.addEventListener('done', () => {
       streamDone = true;
       es.close();
-      // If queue is empty and nothing's playing, we can re-enable now
-      if (playingIdx < 0 && queue.length === 0) {
-        synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
-      }
+      // wait for the last scheduled chunk to actually finish before
+      // re-enabling, so the button reflects playback state
+      scheduleChain.then(() => {
+        const ctx = audioCtx;
+        const remain = ctx ? Math.max(0, (scheduledEnd - ctx.currentTime) * 1000) : 0;
+        setTimeout(finish, useBrowser ? remain + 100 : 0);
+      });
     });
 
-    es.addEventListener('error', (e) => {
-      // SSE error or stream closed unexpectedly
+    es.addEventListener('error', () => {
       es.close();
       if (!streamDone && receivedChunks === 0) {
         toast('streaming synth failed — check server logs', 'bad');
@@ -201,15 +253,36 @@
 
   warmBtn?.addEventListener('click', async () => {
     warmBtn.disabled = true; warmBtn.textContent = 'warming…';
+    // Disable Synthesize until the model is fully loaded — synthesizing
+    // mid-warmup would 409 (service busy) or queue behind it.
+    synthBtn.disabled = true; synthBtn.textContent = 'warming up…';
     try {
       await postJSON('/api/warmup', {});
-      toast('Warmup started — first synth will be fast in ~15 s');
+      toast('Warming up models — please wait…');
     } catch (e) {
       toast(e.message || String(e), 'bad');
-    } finally {
-      // a real "ready" comes via SSE; for now just re-enable after a beat
-      setTimeout(() => { warmBtn.disabled = false; warmBtn.textContent = 'warm up models'; }, 1000);
+      warmBtn.disabled = false; warmBtn.textContent = 'warm up models';
+      synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
+      return;
     }
+    // Poll status until the warmup job finishes (busy clears + job done),
+    // then re-enable both buttons.
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch('/api/status');
+        const s = await r.json();
+        const job = s.job || {};
+        const done = (s.busy_with === null || s.busy_with === undefined) &&
+                     (job.kind !== 'warmup' || job.state === 'done' || job.state === 'error');
+        if (done) {
+          clearInterval(poll);
+          warmBtn.disabled = false; warmBtn.textContent = 'warm up models';
+          synthBtn.disabled = false; synthBtn.textContent = 'Synthesize';
+          if (job.state === 'error') toast('Warmup failed — check server logs', 'bad');
+          else toast('Models ready — synth will be fast now');
+        }
+      } catch (_) { /* keep polling */ }
+    }, 1000);
   });
 </script>
 {% endblock %}

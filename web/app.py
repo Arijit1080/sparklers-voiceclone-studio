@@ -46,6 +46,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+# Single-slot guard for Jetson-speaker playback.  The busy lock releases
+# when GENERATION finishes, but the persistent aplay keeps draining its
+# buffered audio after that — so a quick second Synthesize would start a
+# 2nd aplay that overlaps the 1st.  We track the live aplay process here
+# and kill it before starting a new one (new synth interrupts old).
+import threading as _threading
+_JETSON_APLAY_LOCK = _threading.Lock()
+_JETSON_APLAY: dict = {"proc": None}
+
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR    = Path(__file__).parent / "static"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -125,6 +134,12 @@ async def dashboard_page(request: Request):
 class EnrollReq(BaseModel):
     display_name: str = Field(min_length=1, max_length=64)
     seconds: float = Field(default=30.0, ge=3.0, le=120.0)
+    ref_seconds: float = Field(default=3.0, ge=2.0, le=12.0)
+
+
+class RefLenReq(BaseModel):
+    voice_key: str
+    seconds: float = Field(ge=2.0, le=12.0)
 
 
 class SpeakReq(BaseModel):
@@ -145,16 +160,29 @@ async def api_enroll_start(req: EnrollReq):
     if SERVICE.busy_with() is not None:
         raise HTTPException(409, f"service is busy: {SERVICE.busy_with()}")
     try:
-        job = SERVICE.start_enrollment(req.display_name, req.seconds)
+        job = SERVICE.start_enrollment(req.display_name, req.seconds,
+                                       ref_seconds=req.ref_seconds)
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"job_id": job.job_id, "started_at": job.started_at}
+
+
+@app.post("/api/voice/reference_length")
+def api_voice_reference_length(req: RefLenReq):
+    """Re-crop an existing voice's reference to a new length (3/5.5/8s)
+    with a clean onset.  Synchronous (runs Whisper) — FastAPI runs this
+    sync handler in a threadpool so the event loop isn't blocked."""
+    res = SERVICE.set_voice_reference_length(req.voice_key, req.seconds)
+    if not res.get("ok"):
+        raise HTTPException(409, res.get("error", "failed"))
+    return res
 
 
 @app.post("/api/enroll/upload")
 async def api_enroll_upload(
     display_name: str = Form(..., min_length=1, max_length=64),
     file: UploadFile = File(...),
+    ref_seconds: float = Form(3.0),
 ):
     """Enroll from an uploaded WAV (or any soundfile-readable audio).
 
@@ -189,7 +217,8 @@ async def api_enroll_upload(
              staged.name, len(body), display_name)
 
     try:
-        job = SERVICE.start_enrollment_from_wav(display_name, staged)
+        job = SERVICE.start_enrollment_from_wav(display_name, staged,
+                                                ref_seconds=ref_seconds)
     except Exception as e:
         raise HTTPException(400, str(e))
     return {"job_id": job.job_id, "started_at": job.started_at,
@@ -225,6 +254,8 @@ async def api_speak_stream(
     tau: float = 3.0,
     nfe_step: int = 16,
     speed: float = 1.0,
+    chunk_mode: str = "smart",
+    playback: str = "browser",
 ):
     """Sentence-level streaming synth.
 
@@ -250,14 +281,89 @@ async def api_speak_stream(
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     SENTINEL = object()
 
+    # ---- Jetson-speaker playback (server-side, sequential) ----
+    # The browser path schedules chunks gaplessly via Web Audio.  For the
+    # Jetson speaker we must NOT fire one aplay per chunk (they'd overlap,
+    # since chunks arrive before the previous finishes).  Instead we pipe
+    # every chunk's raw PCM into ONE persistent aplay process in order —
+    # seamless, no overlap, still streaming.
+    import queue as _queue
+    do_jetson = playback in ("jetson", "both")
+    play_q: "_queue.Queue" = _queue.Queue()
+    PLAY_SENTINEL = object()
+
+    def jetson_player():
+        import subprocess, wave, shutil, os as _os
+        aplay = shutil.which("aplay")
+        proc = None
+        try:
+            while True:
+                path = play_q.get()
+                if path is PLAY_SENTINEL:
+                    break
+                if aplay is None:
+                    continue
+                try:
+                    with wave.open(str(path), "rb") as w:
+                        sr = w.getframerate(); ch = w.getnchannels()
+                        sw = w.getsampwidth()
+                        pcm = w.readframes(w.getnframes())
+                except Exception:
+                    log.exception("jetson playback: read %s", path)
+                    continue
+                if proc is None:
+                    fmt = {1: "S8", 2: "S16_LE", 3: "S24_LE",
+                           4: "S32_LE"}.get(sw, "S16_LE")
+                    cmd = [aplay, "-q", "-t", "raw", "-f", fmt,
+                           "-r", str(sr), "-c", str(ch)]
+                    dev = _os.environ.get("SPARKLERS_APLAY_DEV", "default")
+                    if dev and dev != "default":
+                        cmd += ["-D", dev]
+                    # interrupt any previous still-draining aplay so the
+                    # new playback never overlaps the old one
+                    with _JETSON_APLAY_LOCK:
+                        old = _JETSON_APLAY.get("proc")
+                        if old is not None and old.poll() is None:
+                            try:
+                                old.kill()
+                            except Exception:
+                                pass
+                        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                        _JETSON_APLAY["proc"] = proc
+                try:
+                    proc.stdin.write(pcm)
+                    proc.stdin.flush()
+                except Exception:
+                    # aplay was killed by a newer playback — stop quietly
+                    break
+        finally:
+            if proc is not None and proc.stdin is not None:
+                try:
+                    proc.stdin.close(); proc.wait()
+                except Exception:
+                    pass
+            with _JETSON_APLAY_LOCK:
+                if _JETSON_APLAY.get("proc") is proc:
+                    _JETSON_APLAY["proc"] = None
+
+    if do_jetson:
+        threading.Thread(target=jetson_player, daemon=True,
+                         name="jetson-play").start()
+
     def worker():
         try:
-            chunks = voice_pkg.split_sentences(text)
+            if chunk_mode == "sentence":
+                chunks = voice_pkg.split_by_fullstop(text)
+            else:
+                chunks = voice_pkg.split_sentences(text)
             loop.call_soon_threadsafe(queue.put_nowait,
                 {"event": "plan", "data": {"chunks": len(chunks), "text": chunks}})
             for i, result in enumerate(voice_pkg.speak_stream(
-                voice_key, text, speed=speed, tau=tau, nfe_step=nfe_step
+                voice_key, text, speed=speed, tau=tau, nfe_step=nfe_step,
+                chunk_mode=chunk_mode,
             )):
+                if do_jetson:
+                    play_q.put(result.wav_path)
                 loop.call_soon_threadsafe(queue.put_nowait, {
                     "event": "chunk",
                     "data": {
@@ -275,6 +381,8 @@ async def api_speak_stream(
             loop.call_soon_threadsafe(queue.put_nowait,
                 {"event": "error", "data": {"error": str(e)}})
         finally:
+            if do_jetson:
+                play_q.put(PLAY_SENTINEL)
             loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
 
     threading.Thread(target=worker, daemon=True,

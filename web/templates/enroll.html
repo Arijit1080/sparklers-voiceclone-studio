@@ -32,6 +32,14 @@
       <label for="seconds">Recording length (seconds)</label>
       <input id="seconds" type="number" value="30" min="3" max="120" step="1">
     </div>
+    <div class="col">
+      <label for="ref-seconds">Reference length</label>
+      <select id="ref-seconds" title="shorter = faster start (~2s @ 3s), longer = better fidelity">
+        <option value="3.0" selected>3s — fastest start (~2s)</option>
+        <option value="5.5">5.5s — balanced</option>
+        <option value="8.0">8s — best fidelity</option>
+      </select>
+    </div>
     <div class="col" style="display:flex;align-items:flex-end">
       <button id="start" class="btn">Start recording</button>
     </div>
@@ -241,6 +249,7 @@
       const form = new FormData();
       form.append('display_name', name);
       form.append('file', pickedFile);
+      form.append('ref_seconds', document.getElementById('ref-seconds').value);
       const r = await fetch('/api/enroll/upload', { method: 'POST', body: form });
       if (!r.ok) {
         const e = await r.json().catch(() => ({detail: r.statusText}));
@@ -278,7 +287,8 @@
       const r = await fetch('/api/enroll/start', {
         method: 'POST',
         headers: {'content-type': 'application/json'},
-        body: JSON.stringify({display_name: name, seconds}),
+        body: JSON.stringify({display_name: name, seconds,
+          ref_seconds: parseFloat(document.getElementById('ref-seconds').value)}),
       });
       if (!r.ok) {
         const e = await r.json().catch(() => ({detail: r.statusText}));

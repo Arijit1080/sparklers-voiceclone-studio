@@ -27,7 +27,17 @@
       <tr data-key="{{ v.key }}">
         <td><strong>{{ v.display_name }}</strong></td>
         <td><span class="pill">{{ v.key }}</span></td>
-        <td>{{ "%.1f"|format(v.seconds) }}</td>
+        <td>
+          <select class="ref-len" data-key="{{ v.key }}" style="width:62px"
+                  title="reference length — shorter = faster start, longer = better fidelity">
+            <option value="3.0"  {% if v.seconds < 4.0 %}selected{% endif %}>3s</option>
+            <option value="5.5"  {% if 4.0 <= v.seconds < 7.0 %}selected{% endif %}>5.5s</option>
+            <option value="8.0"  {% if v.seconds >= 7.0 %}selected{% endif %}>8s</option>
+          </select>
+          <button class="btn small ref-apply" data-key="{{ v.key }}"
+                  title="re-crop reference (clean onset, re-transcribe)">apply</button>
+          <span class="ref-status small muted" data-key="{{ v.key }}"></span>
+        </td>
         <td>{{ "%.1f"|format(v.rms_dbfs) }}</td>
         <td>{{ "%.0f"|format(v.voiced_ratio * 100) }}%</td>
         <td class="small muted"
@@ -77,6 +87,39 @@
         const e = await r.json().catch(() => ({detail: r.statusText}));
         toast(`Delete failed: ${e.detail || r.statusText}`, 'bad');
         btn.disabled = false;
+      }
+    });
+  });
+
+  // Per-voice reference-length re-crop (3 / 5.5 / 8 s, clean onset)
+  document.querySelectorAll('button.ref-apply').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = btn.dataset.key;
+      const sel = document.querySelector(`select.ref-len[data-key="${key}"]`);
+      const status = document.querySelector(`span.ref-status[data-key="${key}"]`);
+      const secs = parseFloat(sel.value);
+      btn.disabled = true; sel.disabled = true;
+      status.textContent = 're-cropping…';
+      try {
+        const r = await fetch('/api/voice/reference_length', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({voice_key: key, seconds: secs}),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.ok) {
+          status.textContent = `✓ ${j.seconds}s`;
+          toast(`${key}: reference set to ${j.seconds}s (clean onset)`);
+        } else {
+          status.textContent = '';
+          toast(`Failed: ${j.detail || j.error || r.statusText}`, 'bad');
+        }
+      } catch (e) {
+        status.textContent = '';
+        toast(`Failed: ${e.message || e}`, 'bad');
+      } finally {
+        btn.disabled = false; sel.disabled = false;
+        setTimeout(() => { if (status.textContent.startsWith('✓')) status.textContent=''; }, 4000);
       }
     });
   });

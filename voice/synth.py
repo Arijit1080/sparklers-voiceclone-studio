@@ -138,6 +138,11 @@ def speak(
     tau: float = DEFAULT_CFG,            # repurposed → cfg_strength
     nfe_step: int = DEFAULT_NFE,
     output: Optional[Path] = None,
+    trailing_pad_ms: int = 0,            # silence appended after trim —
+                                         # used by streaming to put a
+                                         # natural pause after a sentence
+    tail_fade_ms: int = 0,               # >0 → longer fade-out for a
+                                         # graceful end (last chunk only)
 ) -> SynthResult:
     """Generate `text` in the enrolled voice using F5-TTS."""
     text = (text or "").strip()
@@ -180,8 +185,13 @@ def speak(
         cross_fade_duration=0.15,
     )
     # Cheap in-memory silence trim (no re-read; rewrites only when it
-    # actually crops > ~30 ms).
-    n_out = _hard_trim_silence_inplace(wav, sr, output)
+    # actually crops > ~30 ms).  trailing_pad_ms appends a controlled
+    # pause after the trim so a sentence-final chunk gets a natural beat
+    # before the next chunk butt-joins onto it.
+    n_out = _hard_trim_silence_inplace(
+        wav, sr, output, trailing_pad_ms=trailing_pad_ms,
+        tail_fade_ms=tail_fade_ms,
+    )
     elapsed = time.monotonic() - t0
     seconds = n_out / float(sr)
 
@@ -268,12 +278,22 @@ def _hard_trim_silence_inplace(
     sr: int,
     wav_path: Path,
     head_db: float = -42.0,
-    tail_db: float = -42.0,
+    tail_db: float = -47.0,  # keep the word's real decay (above -47) but
+                             # cut the low-level F5 noise-floor tail
+                             # (-48..-54 dB) — left in, that faint garbled
+                             # tail is audible as "distortion" in the
+                             # quiet pause before the next chunk
     sil_db: float = -45.0,
-    fade_ms: int = 15,
+    fade_ms: int = 8,        # short — just enough to kill edge clicks
     min_trim_ms: int = 30,
     keep_pause_ms: int = 280,
     max_internal_sil_ms: int = 320,
+    trailing_pad_ms: int = 0,   # silence appended AFTER the fade-out, to
+                                # give a sentence-final chunk a natural
+                                # beat before the next chunk butt-joins on
+    tail_fade_ms: int = 0,      # if >0, use this (longer) fade on the END
+                                # only — a graceful taper for the last
+                                # chunk instead of the abrupt 8ms cut
 ) -> int:
     """Clean the waveform F5-TTS just returned:
 
@@ -304,13 +324,59 @@ def _hard_trim_silence_inplace(
     rms = _np.sqrt(_np.mean(a[:n_full].reshape(-1, win).astype(_np.float64) ** 2, axis=1) + 1e-12)
     rms_db = 20.0 * _np.log10(rms + 1e-12)
 
-    # ---- 1. head/tail trim ----
-    voiced = _np.where(rms_db > head_db)[0]
-    if voiced.size == 0:
+    # ---- 1. head trim — remove a leading "ahh"/breath artifact ----
+    # F5 sometimes emits a brief, QUIET vocalization ("ahh"/breath) then a
+    # gap BEFORE the first real word — audible at every chunk start.  We
+    # only strip it when its signature is unmistakable, so we NEVER clip a
+    # real first word:
+    #   (a) the initial voiced run is short  (<= 90 ms),
+    #   (b) it is quiet — peak < -28 dBFS    (real words are louder),
+    #   (c) it is followed by a >= 40 ms gap, and
+    #   (d) there is real speech after that gap.
+    # Otherwise we fall back to a plain leading-silence trim.
+    voiced_mask = rms_db > head_db
+    fv = _np.where(voiced_mask)[0]
+    if fv.size == 0:
         return a.size
-    start = int(voiced[0]) * win
+    s0 = int(fv[0])
+    # The artifact is quieter than the chunk's REAL speech.  Use a
+    # threshold relative to this chunk's own speech level (70th pct of
+    # voiced frames) so it adapts to loud and quiet scripts alike — an
+    # absolute dB cutoff misses louder "ahh"s in some texts.
+    sp = rms_db[voiced_mask]
+    typ = float(_np.percentile(sp, 70)) if sp.size else -28.0
+    ahh_ceil = typ - 8.0          # >= 8 dB below real speech = artifact
+    # walk the initial voiced run until a >= 2-frame (40 ms) gap
+    j = s0
+    gap_run = 0
+    while j < len(voiced_mask):
+        if voiced_mask[j]:
+            gap_run = 0
+        else:
+            gap_run += 1
+            if gap_run >= 2:
+                break
+        j += 1
+    run_end = j - gap_run
+    run_len_ms = (run_end - s0 + 1) * (win * 1000.0 / sr)
+    run_peak = float(_np.max(rms_db[s0:run_end + 1])) if run_end >= s0 else -120.0
+    after = _np.where(voiced_mask[j:])[0]
+    # it's the artifact only if: short run, quiet vs real speech, a gap
+    # after it, and real speech following.  Real first words are at full
+    # speech level (>= ahh_ceil) so they're never trimmed.
+    if (run_len_ms <= 110.0 and run_peak < ahh_ceil
+            and gap_run >= 2 and after.size > 0):
+        start_frame = j + int(after[0])         # skip the artifact + gap
+    else:
+        start_frame = s0                        # keep the real onset
+    start = max(0, start_frame - 1) * win       # ~20 ms lead
+
     voiced_tail = _np.where(rms_db > tail_db)[0]
+    if voiced_tail.size == 0:
+        return a.size
     end = min((int(voiced_tail[-1]) + 1) * win, a.size)
+    if end <= start:
+        return a.size
     core = a[start:end]
 
     # ---- 2. compress internal silences ----
@@ -346,7 +412,8 @@ def _hard_trim_silence_inplace(
 
     if rebuilt is core:
         cut_total_ms = (start + (a.size - end)) * 1000 / sr
-        if cut_total_ms < min_trim_ms:
+        # rewrite if we trimmed something OR we need to append a pad
+        if cut_total_ms < min_trim_ms and trailing_pad_ms <= 0:
             return a.size                       # nothing worth rewriting
         out = core.copy()
     else:
@@ -357,6 +424,20 @@ def _hard_trim_silence_inplace(
         ramp = _np.linspace(0.0, 1.0, fade, dtype=_np.float32)
         out[:fade] *= ramp
         out[-fade:] *= ramp[::-1]
+
+    # graceful end-of-utterance taper: a longer cosine fade on the tail
+    # so the last chunk doesn't cut off abruptly
+    if tail_fade_ms > 0:
+        tf = min(out.size, max(1, int(sr * tail_fade_ms / 1000.0)))
+        cos_ramp = (0.5 * (1.0 + _np.cos(
+            _np.linspace(0.0, _np.pi, tf, dtype=_np.float32))))
+        out[-tf:] *= cos_ramp
+
+    # append the trailing pause AFTER the fade-out so the chunk ends at
+    # silence and the next chunk starts cleanly after a natural beat
+    if trailing_pad_ms > 0:
+        pad = _np.zeros(int(sr * trailing_pad_ms / 1000.0), dtype=out.dtype)
+        out = _np.concatenate([out, pad])
 
     sf.write(str(wav_path), out, sr)
     return out.size
@@ -369,12 +450,28 @@ import re
 _SENT_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
 
 
+def split_by_fullstop(text: str) -> list[str]:
+    """One chunk per sentence — split only on . ! ? boundaries.
+
+    Natural sentence chunking.  Each chunk is a whole sentence, so the
+    prosody is never cut mid-thought.  Downside vs the smart splitter:
+    a long sentence becomes one big chunk that renders slowly, so there
+    can be a gap before it during streaming.  This is the 'per fullstop'
+    option exposed in the UI.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+
+
 def split_sentences(
     text: str,
-    target_chars: int = 140,
-    max_chars: int = 260,
-    first_chunk_min: int = 24,
-    first_chunk_max: int = 55,
+    target_chars: int = 46,
+    max_chars: int = 62,
+    first_chunk_min: int = 44,
+    first_chunk_max: int = 54,
+    min_chunk_chars: int = 36,
 ) -> list[str]:
     """
     Split text into chunks for smooth streaming playback.
@@ -400,24 +497,62 @@ def split_sentences(
     if not text:
         return []
 
+    def _wrap_words(s: str, limit: int) -> list[str]:
+        """Split `s` into BALANCED pieces of roughly `limit` chars on word
+        boundaries.  Greedy wrapping leaves an uneven tail (e.g. a 90-char
+        piece next to an 18-char one); balanced wrapping makes every piece
+        ~equal so no single chunk is oversized — an oversized chunk renders
+        slower than the previous chunk plays and intermittently underruns
+        the streaming playback buffer."""
+        words = s.split()
+        if not words:
+            return []
+        total = sum(len(w) for w in words) + (len(words) - 1)
+        n = max(1, round(total / max(1, limit)))
+        if n <= 1:
+            return [s]
+        per = total / n            # fair share per piece
+        out_w: list[str] = []
+        buf: list[str] = []
+        buflen = 0
+        for w in words:
+            add = len(w) + (1 if buf else 0)
+            # close the current piece if it has reached its fair share and
+            # we still owe more pieces (keep at least 1 word per piece)
+            if buf and (buflen + add) > per * 1.12 and len(out_w) < n - 1:
+                out_w.append(" ".join(buf))
+                buf = [w]; buflen = len(w)
+            else:
+                buf.append(w); buflen += add
+        if buf:
+            out_w.append(" ".join(buf))
+        return out_w
+
     # 1. coarse-split on sentence punctuation
     raw = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
 
-    # 2. break any oversized sentence on commas/semicolons
+    # 2. break any oversized sentence on commas/semicolons, then on word
+    #    boundaries — so even a long comma-less sentence becomes several
+    #    small chunks (a single big chunk renders slower than the prior
+    #    chunk plays → a multi-second gap in streaming playback).
     pieces: list[str] = []
     for sent in raw:
-        if len(sent) <= max_chars:
+        if len(sent) <= target_chars:
             pieces.append(sent)
             continue
         sub = [s.strip() for s in re.split(r'(?<=[,;:])\s+', sent) if s.strip()]
         buf = ""
         for s in sub:
-            if len(buf) + 1 + len(s) <= max_chars:
-                buf = (buf + " " + s).strip()
-            else:
-                if buf:
-                    pieces.append(buf)
-                buf = s
+            # a comma-clause that's itself too long → word-wrap it so no
+            # single piece exceeds target_chars
+            parts = [s] if len(s) <= target_chars else _wrap_words(s, target_chars)
+            for part in parts:
+                if buf and len(buf) + 1 + len(part) <= target_chars:
+                    buf = (buf + " " + part).strip()
+                else:
+                    if buf:
+                        pieces.append(buf)
+                    buf = part
         if buf:
             pieces.append(buf)
 
@@ -483,8 +618,47 @@ def split_sentences(
         if cut_at > 0:
             head = first[:cut_at].strip()
             tail = first[cut_at:].strip()
-            if head and tail and len(tail) >= 12:
+            # only split off a SUBSTANTIAL tail.  A tiny orphan tail
+            # (e.g. "physicist") can't merge cleanly into the next body
+            # chunk without making it oversized, so it survives as a
+            # buffer-draining short chunk.  If the tail would be tiny,
+            # leave the first chunk whole (slightly higher TTfA, but it
+            # banks a big initial playback buffer → robust gaplessness).
+            if head and tail and len(tail) >= 18:
                 out = [head, tail] + out[1:]
+
+    # 6. CONSOLIDATE the BODY chunks — every chunk after the first must
+    #    be >= min_chunk_chars.  A short body chunk's audio drains the
+    #    playback buffer faster than the next chunk can render (~2.4-2.8s
+    #    wall on the Jetson), so a too-short chunk → intermittent gap.
+    #    The FIRST chunk is exempt: it renders at the lower first-chunk
+    #    nfe (faster) AND it builds the initial buffer, so it can stay
+    #    small for a fast time-to-first-audio.  Absorb short body chunks
+    #    forward; fold a short trailing chunk back into the previous one.
+    if len(out) >= 3:
+        first = out[0]
+        merged: list[str] = []
+        for piece in out[1:]:
+            if merged and len(merged[-1]) < min_chunk_chars:
+                combined = (merged[-1] + " " + piece).strip()
+                if len(combined) <= max_chars:
+                    # absorb the short chunk forward
+                    merged[-1] = combined
+                else:
+                    # too big for one chunk, too small as two uneven ones
+                    # → re-split the pair into BALANCED halves so neither
+                    # is short (drains buffer) nor oversized (renders slow)
+                    halves = _wrap_words(combined, max(1, len(combined) // 2))
+                    merged[-1] = halves[0]
+                    merged.extend(halves[1:])
+            else:
+                merged.append(piece)
+        # NOTE: do NOT fold a short trailing chunk back into the previous
+        # one — a short LAST chunk is harmless (nothing follows it to
+        # starve), whereas folding it makes the last chunk oversized,
+        # which renders slower than its predecessor plays → a gap BEFORE
+        # it.  Leave the last chunk as-is.
+        out = [first] + merged
     return out
 
 
@@ -492,6 +666,18 @@ FIRST_CHUNK_NFE = 12   # lower nfe for the very first chunk only —
                        # 1.7-2.0 s render time at ~5-8 words instead of
                        # ~2.5-3 s at the default nfe=16, with quality
                        # drop limited to the first ~1.5 s of audio
+
+# Natural pause appended after a chunk (except the last) so consecutive
+# chunks don't run together when the client butt-joins them.
+SENTENCE_PAUSE_MS = 20     # minimal beat between chunks
+CLAUSE_PAUSE_MS   = 15
+END_FADE_MS       = 18     # tiny declick on the very last chunk — short
+                           # enough it never swallows the final word
+LAST_CHUNK_PAD_MS = 70     # silence after the last word so its natural
+                           # release has room to finish (no abrupt stop)
+MID_CHUNK_FADE_MS = 28     # smooth tail fade on every non-last chunk so
+                           # it eases into the inter-chunk pause and masks
+                           # any residual low-level tail artifact
 
 
 def speak_stream(
@@ -503,36 +689,71 @@ def speak_stream(
     tau: float = DEFAULT_CFG,
     nfe_step: int = DEFAULT_NFE,
     first_chunk_nfe: int = FIRST_CHUNK_NFE,
+    chunk_mode: str = "smart",
 ):
     """
-    Generator that yields one SynthResult per sentence-sized chunk.
+    Generator that yields one SynthResult per chunk.
 
     The web layer streams these out as SSE events so the browser can
     start playback the moment the first chunk lands while the rest
     render in the background.
 
-    First chunk is rendered at `first_chunk_nfe` (default 12) so
-    time-to-first-audio stays around 1.7-2.0 s on a Jetson Orin Nano.
-    Remaining chunks use `nfe_step` (default 16) for full quality.
+    chunk_mode:
+      "smart"    — size-optimized chunks tuned so each renders before
+                   the previous finishes playing → gapless, ~2.6s start.
+      "sentence" — one chunk per sentence (split on . ! ?).  Natural
+                   sentence prosody, but a long sentence renders slowly
+                   so there can be a gap before it.
+
+    First chunk is rendered at `first_chunk_nfe` (default 12) for a
+    faster start; remaining chunks use `nfe_step` (default 16).
     """
     text = (text or "").strip()
     if not text:
         raise ValueError("text is empty")
 
-    chunks = split_sentences(text)
-    log.info("streaming %d chunks for voice=%s (first_nfe=%d, rest_nfe=%d)",
-             len(chunks), voice_key, first_chunk_nfe, nfe_step)
+    if chunk_mode == "sentence":
+        chunks = split_by_fullstop(text)
+    else:
+        chunks = split_sentences(text)
+    log.info("streaming %d chunks for voice=%s (mode=%s first_nfe=%d rest_nfe=%d)",
+             len(chunks), voice_key, chunk_mode, first_chunk_nfe, nfe_step)
 
+    n = len(chunks)
     for i, chunk in enumerate(chunks):
-        nfe_for_chunk = first_chunk_nfe if i == 0 else nfe_step
+        # Render EVERY streaming chunk at the fast nfe.  This is required,
+        # not just preferred: to keep time-to-first-audio under 2s the
+        # first chunk must be small, and for gap-free playback every
+        # later chunk must render faster than the previous one plays.  At
+        # nfe=16 a chunk only becomes self-sustaining at ~58 chars, which
+        # would push the first chunk (and TTfA) over budget; at the fast
+        # nfe ~36-char chunks already keep up.  Using one nfe throughout
+        # also removes the quality discontinuity between chunk 0 and the
+        # rest.  (`nfe_step` is ignored in smart streaming for this
+        # reason; the non-streaming /api/speak path still honours it.)
+        nfe_for_chunk = first_chunk_nfe
+        # Add a natural beat after this chunk unless it's the last one.
+        # A sentence-final chunk (ends with . ! ?) gets a fuller pause;
+        # a mid-sentence clause split (comma) gets a short one.  Without
+        # this the next chunk butt-joins instantly and sentences run
+        # together unnaturally.
+        is_last = (i == n - 1)
+        if is_last:
+            pad_ms = LAST_CHUNK_PAD_MS   # room for the final word to finish
+        elif chunk.rstrip().endswith((".", "!", "?", "…")):
+            pad_ms = SENTENCE_PAUSE_MS
+        else:
+            pad_ms = CLAUSE_PAUSE_MS
         result = speak(
             voice_key, chunk,
             speed=speed, base_speaker=base_speaker,
             tau=tau, nfe_step=nfe_for_chunk,
             output=OUT_AUDIO / f"{voice_key}-{int(time.time()*1000)}-{i:02d}.wav",
+            trailing_pad_ms=pad_ms,
+            tail_fade_ms=END_FADE_MS if is_last else MID_CHUNK_FADE_MS,
         )
-        log.info("  chunk %d/%d nfe=%d: %r (%.2fs audio, rtf %.2f)",
-                 i + 1, len(chunks), nfe_for_chunk, chunk[:48],
+        log.info("  chunk %d/%d nfe=%d pad=%dms: %r (%.2fs audio, rtf %.2f)",
+                 i + 1, n, nfe_for_chunk, pad_ms, chunk[:48],
                  result.seconds, result.rtf)
         yield result
 

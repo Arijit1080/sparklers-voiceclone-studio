@@ -9,8 +9,11 @@ from .registry import (
     embedding_path,
     enroll_wav_path,
 )
-from .enroll import enroll_from_mic, enroll_from_wav, EnrollmentResult
-from .synth import speak, speak_stream, warmup, SynthResult, available_base_speakers, split_sentences
+from .enroll import (
+    enroll_from_mic, enroll_from_wav, EnrollmentResult,
+    set_reference_length, reduce_reference, REF_LENGTH_CHOICES,
+)
+from .synth import speak, speak_stream, warmup, SynthResult, available_base_speakers, split_sentences, split_by_fullstop
 
 __all__ = [
     "VoiceMeta",
@@ -22,6 +25,9 @@ __all__ = [
     "enroll_wav_path",
     "enroll_from_mic",
     "enroll_from_wav",
+    "set_reference_length",
+    "reduce_reference",
+    "REF_LENGTH_CHOICES",
     "EnrollmentResult",
     "speak",
     "speak_stream",
@@ -29,4 +35,5 @@ __all__ = [
     "SynthResult",
     "available_base_speakers",
     "split_sentences",
+    "split_by_fullstop",
 ]

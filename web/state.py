@@ -97,19 +97,35 @@ class VoiceCloneService:
 
     # ---------- enrollment ----------
 
-    def start_enrollment(self, display_name: str, seconds: float = 30.0) -> JobState:
+    def start_enrollment(self, display_name: str, seconds: float = 30.0,
+                          ref_seconds: float = 3.0) -> JobState:
         if not display_name.strip():
             raise ValueError("voice name is required")
         job = self._claim("enroll")
         threading.Thread(
             target=self._enroll_worker,
-            args=(job, display_name, seconds),
+            args=(job, display_name, seconds, ref_seconds),
             daemon=True,
             name=f"enroll-{job.job_id}",
         ).start()
         return job
 
-    def start_enrollment_from_wav(self, display_name: str, wav_path: Path) -> JobState:
+    def set_voice_reference_length(self, key: str, seconds: float) -> dict:
+        """Re-crop an enrolled voice's reference to `seconds` (clean
+        onset) + re-transcribe.  Synchronous — runs Whisper, ~5-10s."""
+        if self._busy_with not in (None, "synth"):
+            return {"ok": False, "error": f"service busy: {self._busy_with}"}
+        try:
+            new = voice.set_reference_length(key, float(seconds))
+        except Exception as e:    # noqa: BLE001
+            log.exception("set_reference_length failed")
+            return {"ok": False, "error": str(e)}
+        if new is None:
+            return {"ok": False, "error": "no source audio for this voice"}
+        return {"ok": True, "key": key, "seconds": round(new, 2)}
+
+    def start_enrollment_from_wav(self, display_name: str, wav_path: Path,
+                                   ref_seconds: float = 3.0) -> JobState:
         if not display_name.strip():
             raise ValueError("voice name is required")
         if not wav_path.exists():
@@ -117,20 +133,21 @@ class VoiceCloneService:
         job = self._claim("enroll")
         threading.Thread(
             target=self._enroll_from_wav_worker,
-            args=(job, display_name, wav_path),
+            args=(job, display_name, wav_path, ref_seconds),
             daemon=True,
             name=f"enroll-upload-{job.job_id}",
         ).start()
         return job
 
     def _enroll_from_wav_worker(self, job: JobState, display_name: str,
-                                 wav_path: Path) -> None:
+                                 wav_path: Path, ref_seconds: float = 3.0) -> None:
         try:
             key = voice.new_voice_key(display_name)
-            log.info("[%s] enroll-from-wav name=%s key=%s wav=%s",
-                     job.job_id, display_name, key, wav_path)
+            log.info("[%s] enroll-from-wav name=%s key=%s wav=%s ref=%.1fs",
+                     job.job_id, display_name, key, wav_path, ref_seconds)
             result = voice.enroll_from_wav(
                 key, display_name, wav_path,
+                ref_seconds=ref_seconds,
                 on_progress=lambda m, r: self._on_progress(job, m, r),
             )
             job.state = "done"
@@ -164,14 +181,15 @@ class VoiceCloneService:
             "job_id": job.job_id, "t": round(t, 2), "db": round(db, 1),
         })
 
-    def _enroll_worker(self, job: JobState, display_name: str, seconds: float) -> None:
+    def _enroll_worker(self, job: JobState, display_name: str, seconds: float,
+                       ref_seconds: float = 3.0) -> None:
         try:
             key = voice.new_voice_key(display_name)
-            log.info("[%s] enroll start name=%s key=%s seconds=%.1f",
-                     job.job_id, display_name, key, seconds)
+            log.info("[%s] enroll start name=%s key=%s seconds=%.1f ref=%.1fs",
+                     job.job_id, display_name, key, seconds, ref_seconds)
             result = voice.enroll_from_mic(
                 key, display_name,
-                seconds=seconds,
+                seconds=seconds, ref_seconds=ref_seconds,
                 play_cues=True,
                 on_progress=lambda m, r: self._on_progress(job, m, r),
                 on_meter=lambda t, d: self._on_meter(job, t, d),
