@@ -69,6 +69,21 @@ DEFAULT_SWAY        = -1.0
 DEFAULT_SPEED       = 1.0
 TARGET_RMS          = 0.1   # reference loudness normalization
 
+# ---------- automatic speech-rate normalization ----------
+# F5 sets the clone's speech rate to (reference chars/sec) × speed.  Most
+# references already sit in the natural 10–16 ch/s range and sound fine, so we
+# DON'T retune them — we only rein in genuine outliers: a reference faster than
+# NORM_BAND_HI or slower than NORM_BAND_LO is nudged just back to the band edge
+# (the gentlest correction), then hard-clamped so F5 never stretches enough to
+# sound artificial.  The enroll-time selector keeps new voices inside the band,
+# so this is a backstop for odd clips / older voices.  Disable with
+# SPARKLERS_AUTO_SPEED=0.
+AUTO_SPEED_NORMALIZE = os.environ.get("SPARKLERS_AUTO_SPEED", "1") != "0"
+NORM_BAND_LO         = 10.0   # ch/s — below this, gently speed up to the edge
+NORM_BAND_HI         = 16.0   # ch/s — above this, gently slow down to the edge
+NORM_SPEED_MIN       = 0.80
+NORM_SPEED_MAX       = 1.15
+
 # When a voice's "transcript" sidecar is missing or empty we fall back
 # to this string; F5-TTS will still produce audio but quality drops.
 FALLBACK_REF_TEXT = "Hello, this is the reference audio for cloning."
@@ -129,6 +144,30 @@ def _voice_ref_text(voice_key: str) -> str:
     return txt if txt else FALLBACK_REF_TEXT
 
 
+def _auto_speed_factor(meta) -> float:
+    """Gentle playback-speed multiplier for out-of-band references.  Returns
+    1.0 for any reference already in the natural [NORM_BAND_LO, NORM_BAND_HI]
+    range (so good voices are never retuned); otherwise nudges just to the band
+    edge, hard-clamped to [NORM_SPEED_MIN, NORM_SPEED_MAX].
+    """
+    if not AUTO_SPEED_NORMALIZE or meta is None:
+        return 1.0
+    txt = (getattr(meta, "ref_text", "") or "").strip()
+    secs = float(getattr(meta, "seconds", 0.0) or 0.0)
+    if not txt or secs <= 0.0:
+        return 1.0
+    ref_rate = len(txt) / secs
+    if ref_rate < 1.0:
+        return 1.0
+    if ref_rate > NORM_BAND_HI:
+        factor = NORM_BAND_HI / ref_rate        # too fast → slow toward edge
+    elif ref_rate < NORM_BAND_LO:
+        factor = NORM_BAND_LO / ref_rate        # too slow → speed toward edge
+    else:
+        return 1.0                              # already natural — leave alone
+    return float(min(NORM_SPEED_MAX, max(NORM_SPEED_MIN, factor)))
+
+
 def speak(
     voice_key: str,
     text: str,
@@ -159,6 +198,11 @@ def speak(
 
     ref_text = _voice_ref_text(voice_key)
 
+    # Normalize speech rate: nudge a fast/slow reference toward a natural pace.
+    # `speed` from the caller stays a relative control on top of this.
+    norm = _auto_speed_factor(meta)
+    eff_speed = speed * norm
+
     f5 = _get_f5()
 
     if output is None:
@@ -174,7 +218,7 @@ def speak(
         ref_text=ref_text,
         gen_text=text,
         file_wave=str(output),
-        speed=speed,
+        speed=eff_speed,
         nfe_step=nfe_step,
         cfg_strength=tau,
         sway_sampling_coef=DEFAULT_SWAY,
@@ -196,8 +240,8 @@ def speak(
     seconds = n_out / float(sr)
 
     rtf = elapsed / max(0.01, seconds)
-    log.info("synth %s nfe=%d cfg=%.1f '%s' → %s (%.2fs audio, %.2fs wall, rtf=%.2f)",
-             voice_key, nfe_step, tau, text[:40],
+    log.info("synth %s nfe=%d cfg=%.1f speed=%.2f(x%.2f) '%s' → %s (%.2fs audio, %.2fs wall, rtf=%.2f)",
+             voice_key, nfe_step, tau, eff_speed, norm, text[:40],
              output.name, seconds, elapsed, rtf)
 
     return SynthResult(

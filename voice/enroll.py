@@ -33,6 +33,7 @@ from audio import (
     beep,
     db_rms,
     trim_for_enrollment,
+    clean_reference,
 )
 from .registry import (
     VoiceMeta,
@@ -69,33 +70,40 @@ def _get_whisper():
     return _WHISPER
 
 
-def _transcribe(wav_path: Path) -> str:
-    """Auto-transcribe the reference clip. Returns "" on failure.
+def _transcribe_array(audio: np.ndarray, sr: int) -> str:
+    """Transcribe a mono audio array (int16 or float32). Returns "" on failure.
 
-    We read the WAV via soundfile and pass {"array", "sampling_rate"}
-    directly to the HF pipeline so we don't need ffmpeg.
+    Passing the {"array", "sampling_rate"} dict to the HF pipeline avoids any
+    file I/O, so the enroll-time window ranking can score several candidate
+    crops cheaply.
     """
     try:
-        import soundfile as sf
         asr = _get_whisper()
-        audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
-        if audio.ndim > 1:
-            audio = audio[:, 0]
-        # HF Whisper wants 16 kHz mono; our enrollment audio is 16 kHz
-        # already (SAMPLE_RATE=16000), but resample defensively.
+        a = audio[:, 0] if audio.ndim > 1 else audio
+        a = a.astype(np.float32)
+        if np.issubdtype(audio.dtype, np.integer):
+            a = a / 32768.0
+        # HF Whisper wants 16 kHz mono; our enrollment audio is 16 kHz already
+        # (SAMPLE_RATE=16000), but resample defensively.
         if sr != 16000:
-            import numpy as np
-            ratio = 16000 / sr
-            n_new = int(round(len(audio) * ratio))
-            audio = np.interp(
-                np.linspace(0, len(audio) - 1, n_new),
-                np.arange(len(audio)),
-                audio,
-            ).astype("float32")
+            n_new = int(round(len(a) * 16000 / sr))
+            a = np.interp(np.linspace(0, len(a) - 1, n_new),
+                          np.arange(len(a)), a).astype(np.float32)
             sr = 16000
-        out = asr({"array": audio, "sampling_rate": sr})
+        out = asr({"array": a, "sampling_rate": sr})
         text = (out.get("text") or "").strip() if isinstance(out, dict) else str(out).strip()
         return " ".join(text.split())
+    except Exception:
+        log.exception("whisper transcription failed")
+        return ""
+
+
+def _transcribe(wav_path: Path) -> str:
+    """Auto-transcribe a reference WAV. Returns "" on failure."""
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+        return _transcribe_array(audio, sr)
     except Exception:
         log.exception("whisper transcription failed")
         return ""
@@ -121,47 +129,103 @@ REF_TARGET_SEC = 3.0    # F5-TTS reprocesses the WHOLE reference at every
 # Allowed reference lengths exposed in the UI.
 REF_LENGTH_CHOICES = (3.0, 5.5, 8.0)
 
+# Voiced-ratio band for picking the reference window (see _onset_candidates).
+MIN_VOICED_RATIO = 0.72   # below this the window is mostly silence — unusable
+MAX_VOICED_RATIO = 0.94   # above this the window is wall-to-wall speech with no
+                          # inter-word pauses — i.e. the fastest-talking part of
+                          # the clip.  F5 derives clone speed from the reference,
+                          # so a crammed window makes the voice sound rushed.
 
-def _clean_onset_crop(samples: np.ndarray, sr: int, target_sec: float,
-                      pre_pause_ms: int = 80) -> Optional[np.ndarray]:
-    """Find a `target_sec` window that STARTS right after a natural pause.
+# Target speech rate for a reference, in transcript-characters per second.
+# Natural English speech sits around 12–15 ch/s.  The enroll-time selector
+# picks the candidate window whose measured rate is closest to this, and the
+# synth-time normalizer nudges playback toward it (see voice/synth.py).
+TARGET_CH_PER_SEC   = 13.0
+MIN_NATURAL_RATE    = 7.0    # below this a window is silence/garbled, not speech
+MAX_RANK_CANDIDATES = 6      # cap Whisper calls during enroll-time ranking
 
-    A centered crop usually begins mid-word at full energy; F5-TTS then
-    reproduces that abrupt onset as an "eii"/"ahh" artifact at the start
-    of EVERY generation.  Cropping so the reference begins silence→speech
-    fixes it at the source.  Returns the int16 window, or None if no clean
-    onset exists (caller falls back to a centered crop + leading silence).
+
+def _onset_candidates(samples: np.ndarray, sr: int, target_sec: float,
+                      pre_pause_ms: int = 80) -> list[tuple[np.ndarray, float]]:
+    """Every `target_sec` window that starts right after a natural pause and is
+    mostly voiced.  Each is (crop_int16, voiced_ratio).
+
+    Starting silence→speech is what keeps F5 from emitting the "eii"/"ahh"
+    onset artifact.  Naturally-paced windows (voiced_ratio ≤ MAX_VOICED_RATIO)
+    are returned first so callers that only sample a few still see the good
+    ones; crammed windows come last as a fallback.
     """
     a = samples.astype(np.float32)
     win = int(sr * 0.020)
     nf = (a.size // win) * win
     if nf < win:
-        return None
+        return []
     db = 20.0 * np.log10(
         np.sqrt(np.mean((a[:nf] / 32768.0).reshape(-1, win) ** 2, axis=1) + 1e-12) + 1e-12)
     sil = db < -45.0
     need_v = int(target_sec / 0.020)
     pre = max(1, int(pre_pause_ms / 20))
-    best = None
+    target_n = int(target_sec * sr)
+    out: list[tuple[np.ndarray, float]] = []
     i = pre
     while i < len(sil) - need_v:
         if bool(np.all(sil[i - pre:i])):          # a pause just before i
-            voiced_ratio = float((~sil[i:i + need_v]).mean())
-            if voiced_ratio > 0.72 and (best is None or voiced_ratio > best[1]):
-                best = (i, voiced_ratio)
+            vr = float((~sil[i:i + need_v]).mean())
+            if vr >= MIN_VOICED_RATIO:
+                # open a few frames into the pause for a little leading silence
+                start = max(0, (i - 3)) * win
+                crop = a[start:start + target_n]
+                if crop.size >= target_n:
+                    out.append((crop.astype(np.int16), vr))
             i += need_v
             continue
         i += 1
-    if best is None:
+    # stable sort: naturally-paced (not crammed) windows first, in position order
+    out.sort(key=lambda c: c[1] > MAX_VOICED_RATIO)
+    return out
+
+
+def _clean_onset_crop(samples: np.ndarray, sr: int, target_sec: float,
+                      pre_pause_ms: int = 80) -> Optional[np.ndarray]:
+    """Single best clean-onset window by the voiced-ratio heuristic (no
+    transcription).  Used where a quick crop is enough; the enroll path uses
+    the rate-aware `_select_natural_window` instead.  Returns None if no clean
+    onset exists (caller falls back to a centered crop + leading silence).
+    """
+    cands = _onset_candidates(samples, sr, target_sec, pre_pause_ms)
+    if not cands:
         return None
-    # start a few frames into the pause so the window opens on a little
-    # leading silence, then the speech
-    start = max(0, (best[0] - 3)) * win
-    target_n = int(target_sec * sr)
-    crop = a[start:start + target_n]
-    if crop.size < target_n:
-        return None
-    return crop.astype(np.int16)
+    natural = [c for c in cands if c[1] <= MAX_VOICED_RATIO]
+    pool = natural or cands
+    return max(pool, key=lambda c: c[1])[0]
+
+
+def _select_natural_window(samples: np.ndarray, sr: int, target_sec: float,
+                           max_rank: int = MAX_RANK_CANDIDATES,
+                           ) -> tuple[Optional[np.ndarray], str, float]:
+    """Pick the reference window whose *measured* speech rate is closest to
+    TARGET_CH_PER_SEC.  This is the guarantee that a clip never lands on its
+    fastest-talking segment again: we transcribe the top candidate windows and
+    choose by chars-per-second directly, not by the voiced-ratio proxy.
+
+    Returns (crop_int16, ref_text, rate_ch_per_sec); crop is None when there is
+    no clean onset at all (caller falls back to a centered crop).
+    """
+    cands = _onset_candidates(samples, sr, target_sec)
+    if not cands:
+        return None, "", 0.0
+    scored: list[tuple[np.ndarray, str, float, float]] = []
+    for crop, vr in cands[:max_rank]:
+        txt = _transcribe_array(crop, sr)
+        rate = (len(txt) / target_sec) if txt else 0.0
+        scored.append((crop, txt, rate, vr))
+    # prefer windows that actually transcribed to real speech
+    valid = [s for s in scored if s[2] >= MIN_NATURAL_RATE]
+    pool = valid or scored
+    best = min(pool, key=lambda s: abs(s[2] - TARGET_CH_PER_SEC))
+    log.info("window selection: %s -> chose %.1f ch/s (vr=%.2f) from %d candidate(s)",
+             [round(s[2], 1) for s in scored], best[2], best[3], len(cands))
+    return best[0], best[1], best[2]
 
 
 def enroll_from_wav(
@@ -198,13 +262,17 @@ def enroll_from_wav(
         )
 
     target_n = int(ref_seconds * SAMPLE_RATE)
-    # Prefer a CLEAN-ONSET crop from the raw (pre-VAD) audio so the
-    # reference starts silence→speech and F5 never emits the leading
-    # "eii"/"ahh" artifact.
-    cropped = _clean_onset_crop(samples, sr, ref_seconds)
+    # Pick the clean-onset window whose MEASURED speech rate is most natural.
+    # This is the guarantee against the "rushed clone" bug: rather than trust a
+    # voiced-ratio proxy, we transcribe the top candidate windows and choose by
+    # chars-per-second, so the reference never lands on the clip's
+    # fastest-talking 3 seconds.  (Clean onset also avoids the "eii" artifact.)
+    if on_progress: on_progress("choosing a naturally-paced window", 0.30)
+    cropped, ref_text, rate = _select_natural_window(samples, sr, ref_seconds)
     if cropped is not None:
+        log.info("[%s] selected reference window: %.1f ch/s", key, rate)
         if on_progress:
-            on_progress(f"clean-onset {ref_seconds:.1f}s reference", 0.30)
+            on_progress(f"clean-onset {ref_seconds:.1f}s reference ({rate:.0f} ch/s)", 0.45)
     else:
         # fallback: centered crop of the VAD'd audio with a short leading
         # silence prepended so the onset is still clean
@@ -214,14 +282,25 @@ def enroll_from_wav(
             c = c[start:start + target_n]
         lead = np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.int16)
         cropped = np.concatenate([lead, c])[:target_n] if c.size else c
+        ref_text = ""    # transcribed after cleanup below
         if on_progress:
-            on_progress(f"centered {ref_seconds:.1f}s reference (no pause found)", 0.30)
+            on_progress(f"centered {ref_seconds:.1f}s reference (no pause found)", 0.45)
+
+    # High-pass always; gentle spectral gate only if the clip is noisy.
+    # F5-TTS clones whatever it hears, so a clean reference => clean clone.
+    cropped, ns = clean_reference(cropped, SAMPLE_RATE)
+    log.info("[%s] reference cleanup: hp=%.0fHz snr=%.1fdB denoised=%s",
+             key, ns.get("highpass_hz", 0), ns.get("snr_db", 0.0), ns.get("denoised"))
 
     cleaned_wav = enroll_wav_path(key)
     save_wav(cleaned_wav, cropped, SAMPLE_RATE)
 
-    if on_progress: on_progress("transcribing reference (whisper-tiny.en)", 0.55)
-    ref_text = _transcribe(cleaned_wav)
+    # The window selector already transcribed the chosen crop, and the high-pass
+    # doesn't change the words — reuse it.  Only re-transcribe on the fallback
+    # path (or if the selector somehow came back empty).
+    if not ref_text:
+        if on_progress: on_progress("transcribing reference", 0.65)
+        ref_text = _transcribe(cleaned_wav)
     if not ref_text:
         log.warning("[%s] empty transcript — F5-TTS will fall back to placeholder", key)
         ref_text = ""
@@ -285,8 +364,12 @@ def set_reference_length(key: str, target_sec: float) -> Optional[float]:
         sr = SAMPLE_RATE
 
     target_n = int(target_sec * sr)
-    cropped = _clean_onset_crop(samples, sr, target_sec)
-    if cropped is None:
+    # Same rate-aware selection as fresh enrollment — re-cropping must never
+    # land on the fastest-talking window either.
+    cropped, new_text, rate = _select_natural_window(samples, sr, target_sec)
+    if cropped is not None:
+        log.info("[%s] re-crop selected window: %.1f ch/s", key, rate)
+    else:
         # fallback: centered crop + leading silence
         c = samples
         if c.size > target_n:
@@ -294,9 +377,15 @@ def set_reference_length(key: str, target_sec: float) -> Optional[float]:
             c = c[st:st + target_n]
         lead = np.zeros(int(sr * 0.12), dtype=np.int16)
         cropped = np.concatenate([lead, c])[:target_n] if c.size else c
+        new_text = ""
+
+    cropped, ns = clean_reference(cropped, sr)
+    log.info("[%s] re-crop cleanup: hp=%.0fHz snr=%.1fdB denoised=%s",
+             key, ns.get("highpass_hz", 0), ns.get("snr_db", 0.0), ns.get("denoised"))
     save_wav(wav, cropped, sr)
 
-    new_text = _transcribe(wav)
+    if not new_text:                 # fallback path → transcribe the saved clip
+        new_text = _transcribe(wav)
     meta = load_meta(key)
     if meta is not None:
         meta.seconds = round(len(cropped) / sr, 2)

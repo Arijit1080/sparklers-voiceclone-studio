@@ -133,16 +133,65 @@ def save_wav(path: Path, samples: np.ndarray, samplerate: int = SAMPLE_RATE) -> 
 
 
 def load_wav(path: Path) -> tuple[np.ndarray, int]:
-    """Load an int16 mono WAV (or stereo → first channel)."""
-    with wave.open(str(path), "rb") as w:
-        sr = w.getframerate()
-        n  = w.getnframes()
-        ch = w.getnchannels()
-        raw = w.readframes(n)
-    samples = np.frombuffer(raw, dtype=np.int16)
-    if ch > 1:
-        samples = samples.reshape(-1, ch)[:, 0].copy()
+    """Load audio as int16 mono. Returns (samples, sample_rate).
+
+    Fast path is the stdlib `wave` module (standard PCM RIFF WAV). When
+    that fails — a non-PCM WAV (float / WAVE_FORMAT_EXTENSIBLE), or a
+    compressed upload like MP3/FLAC/OGG/M4A — we fall back to soundfile
+    (libsndfile) and then to ffmpeg, so any format the upload form
+    accepts actually decodes instead of raising "file does not start
+    with a RIFF id".
+    """
+    path = Path(path)
+    try:
+        with wave.open(str(path), "rb") as w:
+            sr = w.getframerate()
+            n  = w.getnframes()
+            ch = w.getnchannels()
+            raw = w.readframes(n)
+        samples = np.frombuffer(raw, dtype=np.int16)
+        if ch > 1:
+            samples = samples.reshape(-1, ch)[:, 0].copy()
+        return samples, sr
+    except Exception:
+        pass  # not a plain PCM WAV — try the robust decoders below
+
+    # soundfile handles WAV variants (float/extensible), FLAC, OGG, MP3
+    try:
+        import soundfile as sf
+        data, sr = sf.read(str(path), dtype="int16", always_2d=False)
+        if data.ndim > 1:
+            data = data[:, 0].copy()
+        if data.size:
+            return data.astype(np.int16), int(sr)
+    except Exception:
+        pass
+
+    # ffmpeg as the universal fallback (M4A/AAC and anything else)
+    samples, sr = _decode_with_ffmpeg(path)
     return samples, sr
+
+
+def _decode_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
+    """Decode any audio file to int16 mono 16 kHz via ffmpeg → raw PCM."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            f"could not decode {path.name}: unsupported audio format and "
+            "ffmpeg is not installed"
+        )
+    cmd = [
+        ffmpeg, "-nostdin", "-v", "error",
+        "-i", str(path),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        err = proc.stderr.decode("utf-8", "ignore").strip()[:400]
+        raise RuntimeError(f"ffmpeg failed to decode {path.name}: {err}")
+    samples = np.frombuffer(proc.stdout, dtype=np.int16)
+    return samples, SAMPLE_RATE
 
 
 # ---------- playback ----------
